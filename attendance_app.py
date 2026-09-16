@@ -8,12 +8,37 @@ import os
 from datetime import datetime, timedelta
 import tkinter as tk
 from tkinter import ttk, messagebox, simpledialog, filedialog
+from tkinter import font as tkfont
 from PIL import Image, ImageDraw, ImageFont, ImageTk
 from insightface.app import FaceAnalysis
 
 DB_PATH = "faces.db"
 THRESHOLD = 0.50
-RIGHT_PANEL_WIDTH = 620  # 우측 UI 패널 폭 — 창이 1600x900 고정이라 폭도 고정값으로 잡는다
+RIGHT_PANEL_WIDTH = 620  # 우측 UI 패널 폭 — 1600x900 기준 값이고, 실제로는 px()로 화면 배율을 곱해서 쓴다
+
+# 기준 창 크기(창공시스템과 동일). 모니터가 이보다 작으면 UI_SCALE만큼 전체를 줄여서 띄운다.
+BASE_WIN_W, BASE_WIN_H = 1600, 900
+UI_SCALE = 1.0
+
+
+def px(value):
+    """1600x900 기준으로 잡은 픽셀 값을 현재 화면 배율에 맞춰 바꾼다."""
+    return max(1, int(round(value * UI_SCALE)))
+
+
+def _get_work_area(window):
+    """작업 표시줄을 뺀 실제 사용 가능한 화면 크기(가로, 세로)를 구한다."""
+    try:
+        import ctypes
+        from ctypes import wintypes
+        rect = wintypes.RECT()
+        SPI_GETWORKAREA = 0x0030
+        if ctypes.windll.user32.SystemParametersInfoW(SPI_GETWORKAREA, 0, ctypes.byref(rect), 0):
+            return rect.right - rect.left, rect.bottom - rect.top
+    except Exception:
+        pass
+    # 윈도우가 아니거나 조회에 실패하면 작업 표시줄 높이를 대략 빼서 쓴다
+    return window.winfo_screenwidth(), window.winfo_screenheight() - 48
 
 # ==========================================
 # 0-1. 카메라 화면에 한글 이름을 그리기 위한 폰트
@@ -87,8 +112,49 @@ def load_roster_strict():
     return data
 
 
+def pair_attendance_sessions(rows):
+    """
+    (user_id, name, log_date, log_type, log_time) 기록을 받아 학번+날짜별로 출근→퇴근 한 쌍씩 묶는다.
+    하루에 여러 번 출퇴근할 수 있어서 한 사람이 하루에 여러 건이 나올 수 있다.
+    - 퇴근 없이 다시 출근하면 앞의 출근은 퇴근 기록 없음(check_out=None)으로 남는다.
+    - 출근 없이 퇴근만 있으면 출근 기록 없음(check_in=None)으로 남긴다.
+    반환: {"user_id", "name", "date", "check_in", "check_out"} 목록 (날짜/시간 순)
+    """
+    sessions = []
+    open_session = {}  # (user_id, log_date) -> 아직 퇴근 안 한 세션
+    ordered = sorted(
+        (r for r in rows if r[0] and r[2]),  # 학번/날짜 없는 이상 데이터는 제외
+        key=lambda r: (r[2], r[4] or "", r[0]),
+    )
+    for user_id, name, log_date, log_type, log_time in ordered:
+        key = (user_id, log_date)
+        if log_type == "CHECK_IN":
+            session = {"user_id": user_id, "name": name, "date": log_date, "check_in": log_time, "check_out": None}
+            sessions.append(session)
+            open_session[key] = session
+        elif log_type == "CHECK_OUT":
+            session = open_session.pop(key, None)
+            if session is not None:
+                session["check_out"] = log_time
+            else:
+                sessions.append({"user_id": user_id, "name": name, "date": log_date, "check_in": None, "check_out": log_time})
+    return sessions
+
+
+def session_seconds(session):
+    """출근~퇴근 사이 시간(초). 둘 중 하나라도 없거나 계산이 안 되면 0."""
+    if not (session["check_in"] and session["check_out"]):
+        return 0
+    try:
+        t_in = datetime.strptime(f"{session['date']} {session['check_in']}", "%Y-%m-%d %H:%M:%S")
+        t_out = datetime.strptime(f"{session['date']} {session['check_out']}", "%Y-%m-%d %H:%M:%S")
+    except (TypeError, ValueError):
+        return 0
+    return max(0, (t_out - t_in).total_seconds())
+
+
 def export_attendance_json():
-    """출결 기록 전체를 학번+날짜별로 묶어서 창공시스템이 읽을 수 있는 attendance.json으로 내보낸다."""
+    """출결 기록 전체를 출근→퇴근 한 쌍씩 묶어서 창공시스템이 읽을 수 있는 attendance.json으로 내보낸다."""
     try:
         conn = sqlite3.connect(DB_PATH)
         cursor = conn.cursor()
@@ -100,26 +166,20 @@ def export_attendance_json():
         rows = cursor.fetchall()
         conn.close()
 
-        grouped = {}
-        for user_id, name, log_date, log_type, log_time in rows:
-            if not user_id or not log_date:
-                continue  # 날짜 없는 이상 데이터는 내보내지 않는다
-            key = (user_id, log_date)
-            if key not in grouped:
-                grouped[key] = {
-                    "StudentId": user_id,
-                    "Name": name,
-                    "Date": log_date,
-                    "CheckIn": None,
-                    "CheckOut": None,
-                }
-            if log_type == "CHECK_IN":
-                grouped[key]["CheckIn"] = log_time
-            elif log_type == "CHECK_OUT":
-                grouped[key]["CheckOut"] = log_time
+        # 하루에 여러 번 출퇴근하면 같은 학번/날짜로 여러 건이 들어간다 (시간순)
+        records = [
+            {
+                "StudentId": s["user_id"],
+                "Name": s["name"],
+                "Date": s["date"],
+                "CheckIn": s["check_in"],
+                "CheckOut": s["check_out"],
+            }
+            for s in pair_attendance_sessions(rows)
+        ]
 
         with open(ATTENDANCE_EXPORT_PATH, "w", encoding="utf-8") as f:
-            json.dump(list(grouped.values()), f, ensure_ascii=False, indent=2)
+            json.dump(records, f, ensure_ascii=False, indent=2)
     except Exception:
         # 내보내기 실패는 치명적이지 않다 — 다음 출결 처리 때 다시 시도한다
         pass
@@ -177,14 +237,22 @@ def init_db():
         )
     """)
 
-    # 기본 관리자 계정 생성 (dongseo@mail.com / admin1234)
-    cursor.execute("SELECT id FROM users WHERE user_id = 'dongseo@mail.com'")
+    # 예전 기본 관리자 계정(dongseo@mail.com / admin1234)이 남아 있으면 새 계정으로 바꾼다
+    cursor.execute("SELECT id FROM users WHERE user_id = '1234'")
+    if not cursor.fetchone():
+        cursor.execute("""
+            UPDATE users SET user_id = '1234', password = '1234'
+            WHERE user_id = 'dongseo@mail.com' AND role = 'admin'
+        """)
+
+    # 기본 관리자 계정 생성 (1234 / 1234)
+    cursor.execute("SELECT id FROM users WHERE user_id = '1234'")
     if not cursor.fetchone():
         dummy_embedding = np.zeros(512, dtype=np.float32).tobytes()
         cursor.execute("""
             INSERT INTO users (user_id, password, name, major, role, embedding, penalty)
             VALUES (?, ?, ?, ?, ?, ?, ?)
-        """, ('dongseo@mail.com', 'admin1234', '관리자', '시스템관리', 'admin', dummy_embedding, 0))
+        """, ('1234', '1234', '관리자', '시스템관리', 'admin', dummy_embedding, 0))
 
     conn.commit()
     conn.close()
@@ -217,32 +285,16 @@ def get_weekly_attendance_stats(user_id):
     conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
     cursor.execute("""
-        SELECT log_date, log_type, log_time 
-        FROM attendance_logs 
+        SELECT user_id, name, log_date, log_type, log_time
+        FROM attendance_logs
         WHERE user_id = ? AND log_date >= ?
         ORDER BY log_date ASC, log_time ASC
     """, (user_id, start_date_str))
     logs = cursor.fetchall()
     conn.close()
 
-    # 일자별로 IN / OUT 매칭
-    days = {}
-    for l_date, l_type, l_time in logs:
-        if l_date not in days:
-            days[l_date] = {}
-        days[l_date][l_type] = l_time
-
-    total_seconds = 0
-    for date_str, types in days.items():
-        if 'CHECK_IN' in types and 'CHECK_OUT' in types:
-            try:
-                t_in = datetime.strptime(f"{date_str} {types['CHECK_IN']}", "%Y-%m-%d %H:%M:%S")
-                t_out = datetime.strptime(f"{date_str} {types['CHECK_OUT']}", "%Y-%m-%d %H:%M:%S")
-                diff = (t_out - t_in).total_seconds()
-                if diff > 0:
-                    total_seconds += diff
-            except Exception:
-                pass
+    # 하루에 여러 번 출퇴근할 수 있으니 출근→퇴근 한 쌍마다 시간을 더한다
+    total_seconds = sum(session_seconds(s) for s in pair_attendance_sessions(logs))
 
     total_hours = round(total_seconds / 3600.0, 1)
     return total_hours
@@ -254,31 +306,7 @@ def log_attendance(user_id, name, log_type):
     conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
 
-    if log_type == 'CHECK_IN':
-        cursor.execute("""
-            SELECT id FROM attendance_logs 
-            WHERE user_id = ? AND log_date = ? AND log_type = 'CHECK_IN'
-        """, (user_id, today_date))
-        if cursor.fetchone():
-            conn.close()
-            return False, "이미 오늘 출근 처리가 완료되었습니다."
-            
-    elif log_type == 'CHECK_OUT':
-        cursor.execute("""
-            SELECT id FROM attendance_logs 
-            WHERE user_id = ? AND log_date = ? AND log_type = 'CHECK_OUT'
-        """, (user_id, today_date))
-        already_checked = cursor.fetchone()
-        if already_checked:
-            cursor.execute("""
-                UPDATE attendance_logs SET log_time = ?
-                WHERE id = ?
-            """, (now_time, already_checked[0]))
-            conn.commit()
-            conn.close()
-            export_attendance_json()  # 창공시스템이 읽는 출결 파일도 즉시 갱신
-            return True, f"{now_time} 퇴근이 확인 되었습니다."
-
+    # 하루에 출근/퇴근을 여러 번 할 수 있어서 누를 때마다 새 기록으로 남긴다
     cursor.execute("""
         INSERT INTO attendance_logs (user_id, name, log_type, log_date, log_time)
         VALUES (?, ?, ?, ?, ?)
@@ -303,10 +331,10 @@ class AdminLoginFrame(tk.Frame):
 
         # 외부 마진 시뮬레이션용 프레임
         card_inner = tk.Frame(self, bg="white")
-        card_inner.pack(padx=60, pady=60, fill=tk.BOTH, expand=True)
+        card_inner.pack(padx=px(60), pady=px(60), fill=tk.BOTH, expand=True)
 
         title_row = tk.Frame(card_inner, bg="white")
-        title_row.pack(fill=tk.X, pady=(0, 30))
+        title_row.pack(fill=tk.X, pady=(0, px(30)))
 
         lbl_title = tk.Label(title_row, text="관리자 로그인", font=("맑은 고딕", 20, "bold"), bg="white", fg="#1E293B")
         lbl_title.pack(side=tk.LEFT)
@@ -374,7 +402,7 @@ class StudentInfoFrame(tk.Frame):
 
         # 학생 얼굴이 인식된 상태에서도 관리자가 바로 로그인 화면으로 넘어갈 수 있는 버튼
         top_bar = tk.Frame(self, bg="white")
-        top_bar.pack(fill=tk.X, padx=15, pady=(10, 0))
+        top_bar.pack(fill=tk.X, padx=px(15), pady=(px(10), 0))
 
         btn_admin = tk.Button(
             top_bar, text="🔑 관리자", bg="#1E293B", fg="white", bd=0,
@@ -386,22 +414,22 @@ class StudentInfoFrame(tk.Frame):
 
         # 이번주 출석 현황 박스 (Clean Card Style)
         stats_frame = tk.Frame(self, bg="#F8FAFC", bd=1, relief=tk.SOLID)
-        stats_frame.pack(fill=tk.X, padx=15, pady=10)
+        stats_frame.pack(fill=tk.X, padx=px(15), pady=px(10))
 
         lbl_stats_title = tk.Label(stats_frame, text="이번주 출석 현황", font=("맑은 고딕", 13, "bold"), bg="#F8FAFC", fg="#1E293B")
-        lbl_stats_title.pack(anchor=tk.W, padx=15, pady=(12, 8))
+        lbl_stats_title.pack(anchor=tk.W, padx=px(15), pady=(px(12), px(8)))
 
         weekly_hours = get_weekly_attendance_stats(student_info["user_id"])
         
         lbl_total = tk.Label(stats_frame, text=f"• total : {weekly_hours} 시간", font=("맑은 고딕", 11), bg="#F8FAFC", fg="#334155")
-        lbl_total.pack(anchor=tk.W, padx=25, pady=2)
+        lbl_total.pack(anchor=tk.W, padx=px(25), pady=px(2))
 
         # 3진 아웃제 기준 패널티 색상 경고 표기
         penalty_val = student_info['penalty']
         penalty_color = "#EF4444" if penalty_val >= 2 else "#F59E0B" if penalty_val == 1 else "#10B981"
         
         penalty_container = tk.Frame(stats_frame, bg="#F8FAFC")
-        penalty_container.pack(anchor=tk.W, padx=25, pady=(2, 12))
+        penalty_container.pack(anchor=tk.W, padx=px(25), pady=(px(2), px(12)))
         
         lbl_penalty_bullet = tk.Label(penalty_container, text="• 패널티 현황 : ", font=("맑은 고딕", 11), bg="#F8FAFC", fg="#334155")
         lbl_penalty_bullet.pack(side=tk.LEFT)
@@ -411,12 +439,12 @@ class StudentInfoFrame(tk.Frame):
 
         # 학생 프로필 정보 박스
         profile_frame = tk.Frame(self, bg="white", bd=1, relief=tk.SOLID)
-        profile_frame.pack(fill=tk.BOTH, expand=True, padx=15, pady=10)
+        profile_frame.pack(fill=tk.BOTH, expand=True, padx=px(15), pady=px(10))
 
         name_masked = student_info["name"][0] + "o" * (len(student_info["name"]) - 1)
 
         info_inner = tk.Frame(profile_frame, bg="white")
-        info_inner.pack(padx=20, pady=20, fill=tk.BOTH, expand=True)
+        info_inner.pack(padx=px(20), pady=px(20), fill=tk.BOTH, expand=True)
 
         lbl_name_tag = tk.Label(info_inner, text="이름", font=("맑은 고딕", 9, "bold"), bg="white", fg="#94A3B8")
         lbl_name_tag.pack(anchor=tk.W, pady=(0, 1))
@@ -484,7 +512,7 @@ class AdminDashboardFrame(tk.Frame):
 
         # 1행: 관리자 정보 + 로그아웃
         top_bar = tk.Frame(self, bg="white")
-        top_bar.pack(fill=tk.X, pady=(10, 4), padx=12)
+        top_bar.pack(fill=tk.X, pady=(px(10), px(4)), padx=px(12))
 
         lbl_admin = tk.Label(top_bar, text=f"🔑 관리자: {self.admin_email}", font=("맑은 고딕", 11, "bold"), bg="white", fg="#334155")
         lbl_admin.pack(side=tk.LEFT, pady=5)
@@ -498,7 +526,7 @@ class AdminDashboardFrame(tk.Frame):
 
         # 2행: 기능 버튼 — 한 줄에 몰아넣으면 글자가 잘려서 아래 줄에 반반 나눠 배치
         action_bar = tk.Frame(self, bg="white")
-        action_bar.pack(fill=tk.X, padx=12, pady=(0, 8))
+        action_bar.pack(fill=tk.X, padx=px(12), pady=(0, px(8)))
 
         btn_refresh = tk.Button(
             action_bar, text="🔄 창공시스템 명단 새로고침", bg="#3B82F6", fg="white", font=("맑은 고딕", 10, "bold"),
@@ -600,20 +628,11 @@ class AdminDashboardFrame(tk.Frame):
             messagebox.showerror("추출 실패", f"출석 데이터를 불러오는 중 오류가 발생했습니다.\n\n{e}")
             return
 
-        # 학번+날짜별로 출근/퇴근을 하나의 행으로 묶는다 (attendance.json 내보내기와 같은 방식)
-        grouped = {}
-        for user_id, name, log_date, log_type, log_time in rows:
-            if not user_id or not log_date:
-                continue
-            key = (user_id, log_date)
-            if key not in grouped:
-                grouped[key] = {"학번": user_id, "이름": name, "날짜": log_date, "출근시간": None, "퇴근시간": None}
-            if log_type == "CHECK_IN":
-                grouped[key]["출근시간"] = log_time
-            elif log_type == "CHECK_OUT":
-                grouped[key]["퇴근시간"] = log_time
-
-        records = sorted(grouped.values(), key=lambda r: (r["날짜"], r["이름"]))
+        # 출근→퇴근 한 쌍을 한 행으로 묶는다 (attendance.json 내보내기와 같은 방식, 하루 여러 번이면 여러 행)
+        records = sorted(
+            pair_attendance_sessions(rows),
+            key=lambda r: (r["date"], r["name"] or "", r["check_in"] or r["check_out"] or ""),
+        )
 
         if not records:
             messagebox.showinfo("추출할 데이터 없음", "저장된 출석 기록이 없습니다.")
@@ -645,19 +664,13 @@ class AdminDashboardFrame(tk.Frame):
                 cell.alignment = Alignment(horizontal="center")
 
             for rec in records:
-                check_in = rec["출근시간"]
-                check_out = rec["퇴근시간"]
+                check_in = rec["check_in"]
+                check_out = rec["check_out"]
 
                 work_hours = ""
-                if check_in and check_out:
-                    try:
-                        t_in = datetime.strptime(f"{rec['날짜']} {check_in}", "%Y-%m-%d %H:%M:%S")
-                        t_out = datetime.strptime(f"{rec['날짜']} {check_out}", "%Y-%m-%d %H:%M:%S")
-                        diff = (t_out - t_in).total_seconds()
-                        if diff > 0:
-                            work_hours = round(diff / 3600.0, 2)
-                    except Exception:
-                        work_hours = ""
+                seconds = session_seconds(rec)
+                if seconds > 0:
+                    work_hours = round(seconds / 3600.0, 2)
 
                 if check_in and check_out:
                     note = "정상 출퇴근"
@@ -669,7 +682,7 @@ class AdminDashboardFrame(tk.Frame):
                     note = "결석"
 
                 ws.append([
-                    rec["학번"], rec["이름"], rec["날짜"],
+                    rec["user_id"], rec["name"], rec["date"],
                     check_in or "-", check_out or "-",
                     work_hours, note,
                 ])
@@ -701,10 +714,10 @@ class AdminDashboardFrame(tk.Frame):
         self.tree_students.heading("major", text="전공")
         self.tree_students.heading("penalty", text="패널티")
         
-        self.tree_students.column("id", width=95, anchor=tk.CENTER)
-        self.tree_students.column("name", width=80, anchor=tk.CENTER)
-        self.tree_students.column("major", width=130, anchor=tk.W)
-        self.tree_students.column("penalty", width=65, anchor=tk.CENTER)
+        self.tree_students.column("id", width=px(95), anchor=tk.CENTER)
+        self.tree_students.column("name", width=px(80), anchor=tk.CENTER)
+        self.tree_students.column("major", width=px(130), anchor=tk.W)
+        self.tree_students.column("penalty", width=px(65), anchor=tk.CENTER)
         self.tree_students.pack(fill=tk.BOTH, expand=True)
         scroll.config(command=self.tree_students.yview)
 
@@ -714,28 +727,32 @@ class AdminDashboardFrame(tk.Frame):
         control_frame = ttk.Frame(self.tab_students)
         control_frame.pack(fill=tk.X, padx=5, pady=5)
 
+        # 삭제 제어 영역 (크기 강화) — 편집 폼보다 먼저 배치해야 화면이 작을 때도 버튼이 찌그러지지 않는다
+        btn_action_frame = ttk.Frame(control_frame)
+        btn_action_frame.pack(side=tk.RIGHT, fill=tk.Y, padx=5, pady=2)
+
         # 선택정보 편집 폼
         form_frame = ttk.LabelFrame(control_frame, text=" 학생 데이터 편집 ")
         form_frame.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=5, pady=2)
 
         ttk.Label(form_frame, text="이름:").grid(row=0, column=0, padx=5, pady=5, sticky=tk.W)
         self.edit_name = ttk.Entry(form_frame, width=9)
-        self.edit_name.grid(row=0, column=1, padx=5, pady=5)
+        self.edit_name.grid(row=0, column=1, padx=5, pady=5, sticky=tk.EW)
 
         ttk.Label(form_frame, text="전공:").grid(row=0, column=2, padx=5, pady=5, sticky=tk.W)
         self.edit_major = ttk.Entry(form_frame, width=12)
-        self.edit_major.grid(row=0, column=3, padx=5, pady=5)
+        self.edit_major.grid(row=0, column=3, padx=5, pady=5, sticky=tk.EW)
 
         ttk.Label(form_frame, text="패널티:").grid(row=0, column=4, padx=5, pady=5, sticky=tk.W)
         self.edit_penalty = ttk.Entry(form_frame, width=4)
         self.edit_penalty.grid(row=0, column=5, padx=5, pady=5)
 
         btn_update = ttk.Button(form_frame, text="수정 완료", command=self.update_student)
-        btn_update.grid(row=0, column=6, padx=8, pady=5)
+        # 입력칸 옆에 두면 화면이 작을 때 잘려서, 입력칸 아래 줄에 폭 전체로 둔다
+        btn_update.grid(row=1, column=0, columnspan=6, padx=5, pady=(0, 5), sticky=tk.EW)
+        form_frame.columnconfigure(1, weight=2)
+        form_frame.columnconfigure(3, weight=3)
 
-        # 삭제 제어 영역 (크기 강화)
-        btn_action_frame = ttk.Frame(control_frame)
-        btn_action_frame.pack(side=tk.RIGHT, fill=tk.Y, padx=5, pady=2)
 
         btn_del_sel = ttk.Button(btn_action_frame, text="선택 삭제", command=self.delete_selected)
         btn_del_sel.pack(fill=tk.X, ipady=4, pady=2)
@@ -747,35 +764,35 @@ class AdminDashboardFrame(tk.Frame):
 
     def build_add_student_tab(self):
         frame = ttk.LabelFrame(self.tab_add_student, text=" 학생 얼굴 및 상세 정보 등록 ")
-        frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
+        frame.pack(fill=tk.BOTH, expand=True, padx=px(10), pady=px(10))
 
         grid_container = tk.Frame(frame, bg="#F8FAFC")
-        grid_container.pack(padx=20, pady=20, fill=tk.BOTH, expand=True)
+        grid_container.pack(padx=px(20), pady=px(20), fill=tk.BOTH, expand=True)
 
         # 창공시스템(SeatManagerApp) 명단에서 골라서 자동 입력 — 수기로 다시 안 쳐도 된다
-        ttk.Label(grid_container, text="창공시스템 명단:", font=("맑은 고딕", 10, "bold"), background="#F8FAFC").grid(row=0, column=0, padx=10, pady=8, sticky=tk.W)
-        self.roster_combo = ttk.Combobox(grid_container, font=("맑은 고딕", 10), width=32, state="readonly")
-        self.roster_combo.grid(row=0, column=1, padx=10, pady=8, sticky=tk.W)
+        ttk.Label(grid_container, text="창공시스템 명단:", font=("맑은 고딕", 10, "bold"), background="#F8FAFC").grid(row=0, column=0, padx=px(10), pady=px(8), sticky=tk.W)
+        self.roster_combo = ttk.Combobox(grid_container, font=("맑은 고딕", 10), width=26, state="readonly")
+        self.roster_combo.grid(row=0, column=1, padx=px(10), pady=px(8), sticky=tk.W)
         self.roster_combo.bind("<<ComboboxSelected>>", self.on_roster_selected)
 
         btn_reload_roster = ttk.Button(grid_container, text="🔄 명단 새로고침", command=lambda: self.reload_roster_combo(show_message_if_empty=True))
-        btn_reload_roster.grid(row=0, column=2, padx=10, pady=8, sticky=tk.W)
+        btn_reload_roster.grid(row=0, column=2, padx=px(10), pady=px(8), sticky=tk.W)
 
-        ttk.Label(grid_container, text="학번(ID):", font=("맑은 고딕", 10, "bold"), background="#F8FAFC").grid(row=1, column=0, padx=10, pady=8, sticky=tk.W)
-        self.add_id = ttk.Entry(grid_container, font=("맑은 고딕", 11), width=30)
-        self.add_id.grid(row=1, column=1, padx=10, pady=8, sticky=tk.W)
+        ttk.Label(grid_container, text="학번(ID):", font=("맑은 고딕", 10, "bold"), background="#F8FAFC").grid(row=1, column=0, padx=px(10), pady=px(8), sticky=tk.W)
+        self.add_id = ttk.Entry(grid_container, font=("맑은 고딕", 11), width=26)
+        self.add_id.grid(row=1, column=1, padx=px(10), pady=px(8), sticky=tk.W)
 
-        ttk.Label(grid_container, text="비밀번호:", font=("맑은 고딕", 10, "bold"), background="#F8FAFC").grid(row=2, column=0, padx=10, pady=8, sticky=tk.W)
-        self.add_pwd = ttk.Entry(grid_container, show="*", font=("맑은 고딕", 11), width=30)
-        self.add_pwd.grid(row=2, column=1, padx=10, pady=8, sticky=tk.W)
+        ttk.Label(grid_container, text="비밀번호:", font=("맑은 고딕", 10, "bold"), background="#F8FAFC").grid(row=2, column=0, padx=px(10), pady=px(8), sticky=tk.W)
+        self.add_pwd = ttk.Entry(grid_container, show="*", font=("맑은 고딕", 11), width=26)
+        self.add_pwd.grid(row=2, column=1, padx=px(10), pady=px(8), sticky=tk.W)
 
-        ttk.Label(grid_container, text="이름:", font=("맑은 고딕", 10, "bold"), background="#F8FAFC").grid(row=3, column=0, padx=10, pady=8, sticky=tk.W)
-        self.add_name = ttk.Entry(grid_container, font=("맑은 고딕", 11), width=30)
-        self.add_name.grid(row=3, column=1, padx=10, pady=8, sticky=tk.W)
+        ttk.Label(grid_container, text="이름:", font=("맑은 고딕", 10, "bold"), background="#F8FAFC").grid(row=3, column=0, padx=px(10), pady=px(8), sticky=tk.W)
+        self.add_name = ttk.Entry(grid_container, font=("맑은 고딕", 11), width=26)
+        self.add_name.grid(row=3, column=1, padx=px(10), pady=px(8), sticky=tk.W)
 
-        ttk.Label(grid_container, text="전공 학과:", font=("맑은 고딕", 10, "bold"), background="#F8FAFC").grid(row=4, column=0, padx=10, pady=8, sticky=tk.W)
-        self.add_major = ttk.Entry(grid_container, font=("맑은 고딕", 11), width=30)
-        self.add_major.grid(row=4, column=1, padx=10, pady=8, sticky=tk.W)
+        ttk.Label(grid_container, text="전공 학과:", font=("맑은 고딕", 10, "bold"), background="#F8FAFC").grid(row=4, column=0, padx=px(10), pady=px(8), sticky=tk.W)
+        self.add_major = ttk.Entry(grid_container, font=("맑은 고딕", 11), width=26)
+        self.add_major.grid(row=4, column=1, padx=px(10), pady=px(8), sticky=tk.W)
         self.add_major.insert(0, "컴퓨터 공학 전공")
 
         # 등록 버튼 크기 강화
@@ -784,7 +801,7 @@ class AdminDashboardFrame(tk.Frame):
             activebackground="#059669", activeforeground="white", font=("맑은 고딕", 12, "bold"),
             height=2, cursor="hand2", command=self.register_student
         )
-        btn_register.grid(row=5, column=0, columnspan=3, pady=25, sticky=tk.EW)
+        btn_register.grid(row=5, column=0, columnspan=3, pady=px(25), sticky=tk.EW)
 
         self._roster_map = {}
         self.reload_roster_combo()
@@ -845,25 +862,25 @@ class AdminDashboardFrame(tk.Frame):
         week_ago_str = (datetime.now() - timedelta(days=7)).strftime("%Y-%m-%d")
 
         ttk.Label(filter_frame, text="시작일:").grid(row=0, column=0, padx=5, pady=5, sticky=tk.W)
-        self.ent_start_date = ttk.Entry(filter_frame, width=12)
+        self.ent_start_date = ttk.Entry(filter_frame, width=10)
         self.ent_start_date.insert(0, week_ago_str)
         self.ent_start_date.grid(row=0, column=1, padx=5, pady=5)
 
         ttk.Label(filter_frame, text="종료일:").grid(row=0, column=2, padx=5, pady=5, sticky=tk.W)
-        self.ent_end_date = ttk.Entry(filter_frame, width=12)
+        self.ent_end_date = ttk.Entry(filter_frame, width=10)
         self.ent_end_date.insert(0, today_str)
         self.ent_end_date.grid(row=0, column=3, padx=5, pady=5)
 
         ttk.Label(filter_frame, text="이름 검색:").grid(row=0, column=4, padx=5, pady=5, sticky=tk.W)
-        self.ent_search_name = ttk.Entry(filter_frame, width=12)
+        self.ent_search_name = ttk.Entry(filter_frame, width=9)
         self.ent_search_name.grid(row=0, column=5, padx=5, pady=5)
 
         # 조회 버튼 크기 강화
         btn_search = tk.Button(
             filter_frame, text="🔍 조회하기", bg="#3B82F6", fg="white", font=("맑은 고딕", 11, "bold"),
-            bd=0, activebackground="#2563EB", cursor="hand2", width=12, height=1
+            bd=0, activebackground="#2563EB", cursor="hand2", padx=px(12), height=1
         )
-        btn_search.grid(row=0, column=6, padx=15, pady=5)
+        btn_search.grid(row=0, column=6, padx=px(10), pady=5)
         btn_search.config(command=self.load_logs_filtered)
 
         # 로그 트리뷰 목록
@@ -883,11 +900,11 @@ class AdminDashboardFrame(tk.Frame):
         self.tree_logs.heading("log_date", text="날짜")
         self.tree_logs.heading("log_time", text="시간")
         
-        self.tree_logs.column("user_id", width=100, anchor=tk.CENTER)
-        self.tree_logs.column("name", width=80, anchor=tk.CENTER)
-        self.tree_logs.column("log_type", width=70, anchor=tk.CENTER)
-        self.tree_logs.column("log_date", width=110, anchor=tk.CENTER)
-        self.tree_logs.column("log_time", width=110, anchor=tk.CENTER)
+        self.tree_logs.column("user_id", width=px(100), anchor=tk.CENTER)
+        self.tree_logs.column("name", width=px(80), anchor=tk.CENTER)
+        self.tree_logs.column("log_type", width=px(70), anchor=tk.CENTER)
+        self.tree_logs.column("log_date", width=px(110), anchor=tk.CENTER)
+        self.tree_logs.column("log_time", width=px(110), anchor=tk.CENTER)
         self.tree_logs.pack(fill=tk.BOTH, expand=True)
         scroll.config(command=self.tree_logs.yview)
 
@@ -1083,18 +1100,34 @@ class AttendanceApp:
         self.window.title("창의공간 얼굴인식 출석체크 시스템")
         self.window.configure(bg="#F1F5F9") # 깔끔한 slate 연회색 배경
 
-        # 창공시스템(SeatManagerApp, MainWindow.xaml)과 동일한 1600x900으로 고정한다.
-        # 예전에는 화면 해상도 비율로 창 크기를 계산하고 리사이즈도 가능했는데,
-        # 그러면 창 크기에 따라 내부 UI 폭/높이가 바뀌면서 학생 등록 탭처럼 내용이
-        # 많은 화면은 잘려 보일 수 있었다. 고정 크기 + 리사이즈 금지로 항상 같은 레이아웃만 나오게 한다.
-        win_w, win_h = 1600, 900
-        screen_w = self.window.winfo_screenwidth()
-        screen_h = self.window.winfo_screenheight()
-        pos_x = max(0, (screen_w - win_w) // 2)
-        pos_y = max(0, (screen_h - win_h) // 2)
+        # 창공시스템(SeatManagerApp, MainWindow.xaml)과 동일한 1600x900 레이아웃을 기준으로 한다.
+        # 리사이즈를 허용하면 내부 UI 폭/높이가 바뀌면서 학생 등록 탭 같은 화면이 잘려 보일 수 있어서
+        # 크기는 고정하되, 모니터가 1600x900보다 작으면 창/글자/여백을 같은 비율로 줄여서 전체가 보이게 한다.
+        global UI_SCALE
+        work_w, work_h = _get_work_area(self.window)
+        # 창 테두리와 제목 표시줄이 차지하는 만큼 여유를 둔다
+        UI_SCALE = min(1.0, (work_w - 16) / BASE_WIN_W, (work_h - 40) / BASE_WIN_H)
+        UI_SCALE = max(UI_SCALE, 0.5)  # 너무 작아져서 글자를 못 읽는 것만 방지
+
+        # 포인트(pt) 단위로 지정한 모든 글꼴이 같은 비율로 줄어들게 한다
+        base_tk_scaling = float(self.window.tk.call("tk", "scaling"))
+        self.window.tk.call("tk", "scaling", base_tk_scaling * UI_SCALE)
+        # 글꼴을 따로 지정하지 않은 라벨/입력칸이 쓰는 기본 글꼴은 픽셀 단위라 위 설정으로 안 줄어서 직접 줄인다
+        for font_name in tkfont.names(self.window):
+            named_font = tkfont.nametofont(font_name, root=self.window)
+            size = int(named_font.cget("size"))
+            if size < 0:
+                named_font.configure(size=-max(1, round(-size * UI_SCALE)))
+
+        win_w, win_h = px(BASE_WIN_W), px(BASE_WIN_H)
+        pos_x = max(0, (work_w - win_w) // 2)
+        pos_y = max(0, (work_h - 40 - win_h) // 2)
 
         self.window.geometry(f"{win_w}x{win_h}+{pos_x}+{pos_y}")
-        self.window.resizable(False, False)  # 리사이즈로 UI가 늘어나는 것 방지
+        # 최대화(전체 화면) 버튼을 쓸 수 있게 크기 조절은 허용하되, 기본 크기보다 작게 줄이면
+        # 오른쪽 패널 내용이 잘리므로 최소 크기를 기본 크기로 막는다. 늘어난 공간은 카메라 화면이 쓴다.
+        self.window.resizable(True, True)
+        self.window.minsize(win_w, win_h)
         self.window_w, self.window_h = win_w, win_h
 
         # UI 스타일 테마 통합 구성
@@ -1103,11 +1136,11 @@ class AttendanceApp:
         
         # Notebook (Tabs) 스타일링
         style.configure('TNotebook', background='#F1F5F9', borderwidth=0)
-        style.configure('TNotebook.Tab', background='#E2E8F0', foreground='#475569', padding=[15, 6], font=('맑은 고딕', 10, 'bold'))
+        style.configure('TNotebook.Tab', background='#E2E8F0', foreground='#475569', padding=[px(15), px(6)], font=('맑은 고딕', 10, 'bold'))
         style.map('TNotebook.Tab', background=[('selected', '#ffffff')], foreground=[('selected', '#1E293B')])
         
         # Treeview 스타일링
-        style.configure('Treeview', background='#ffffff', fieldbackground='#ffffff', rowheight=28, font=('맑은 고딕', 9))
+        style.configure('Treeview', background='#ffffff', fieldbackground='#ffffff', rowheight=px(28), font=('맑은 고딕', 9))
         style.configure('Treeview.Heading', background='#E2E8F0', foreground='#1E293B', font=('맑은 고딕', 10, 'bold'))
         style.map('Treeview', background=[('selected', '#3B82F6')], foreground=[('selected', '#ffffff')])
         
@@ -1116,7 +1149,7 @@ class AttendanceApp:
         style.configure('TLabelframe.Label', background='#ffffff', foreground='#1E293B', font=('맑은 고딕', 10, 'bold'))
 
         # Ttk Button 스타일링 크기 및 패딩 조절로 해상도 대폭 업그레이드
-        style.configure('TButton', font=('맑은 고딕', 11, 'bold'), padding=8)
+        style.configure('TButton', font=('맑은 고딕', 11, 'bold'), padding=px(8))
 
         # DB 초기화
         init_db()
@@ -1172,19 +1205,19 @@ class AttendanceApp:
 
     def create_widgets(self):
         # 상단 헤더 배너 (Modern Dark Slate) — 좌측 타이틀 / 우측 실시간 시계
-        title_frame = tk.Frame(self.window, bg="#0F172A", height=84)
+        title_frame = tk.Frame(self.window, bg="#0F172A", height=px(84))
         title_frame.pack(fill=tk.X, side=tk.TOP)
         title_frame.pack_propagate(False)
 
         header_inner = tk.Frame(title_frame, bg="#0F172A")
-        header_inner.pack(fill=tk.BOTH, expand=True, padx=28)
+        header_inner.pack(fill=tk.BOTH, expand=True, padx=px(28))
 
         title_box = tk.Frame(header_inner, bg="#0F172A")
         title_box.pack(side=tk.LEFT, fill=tk.Y)
 
         lbl_title = tk.Label(title_box, text="창의공간 얼굴인식 출석체크 시스템",
                              bg="#0F172A", fg="white", font=("맑은 고딕", 21, "bold"))
-        lbl_title.pack(anchor=tk.W, pady=(17, 0))
+        lbl_title.pack(anchor=tk.W, pady=(px(17), 0))
 
         lbl_subtitle = tk.Label(title_box, text="동서대학교 창의공간 · Face Recognition Attendance",
                                 bg="#0F172A", fg="#64748B", font=("맑은 고딕", 9))
@@ -1196,39 +1229,39 @@ class AttendanceApp:
 
         # 메인 콘텐츠 컨테이너
         content_frame = tk.Frame(self.window, bg="#F1F5F9")
-        content_frame.pack(fill=tk.BOTH, expand=True, padx=20, pady=20)
+        content_frame.pack(fill=tk.BOTH, expand=True, padx=px(20), pady=px(20))
 
         # 좌측: 카메라 패널 (상단 상태바 + 영상 영역)
         self.camera_panel = tk.Frame(content_frame, bg="#0F172A",
                                      highlightthickness=1, highlightbackground="#CBD5E1")
         self.camera_panel.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
 
-        cam_bar = tk.Frame(self.camera_panel, bg="#1E293B", height=48)
+        cam_bar = tk.Frame(self.camera_panel, bg="#1E293B", height=px(48))
         cam_bar.pack(fill=tk.X, side=tk.TOP)
         cam_bar.pack_propagate(False)
 
         self.lbl_cam_status = tk.Label(cam_bar, text="● LIVE", bg="#1E293B", fg="#10B981",
                                        font=("맑은 고딕", 11, "bold"))
-        self.lbl_cam_status.pack(side=tk.LEFT, padx=16)
+        self.lbl_cam_status.pack(side=tk.LEFT, padx=px(16))
 
         self.btn_camera_toggle = tk.Button(
             cam_bar, text="📷 화면 끄기", bg="#334155", fg="white", bd=0,
             activebackground="#475569", activeforeground="white",
-            font=("맑은 고딕", 10, "bold"), padx=16, pady=5, cursor="hand2",
+            font=("맑은 고딕", 10, "bold"), padx=px(16), pady=px(5), cursor="hand2",
             command=self.toggle_camera
         )
-        self.btn_camera_toggle.pack(side=tk.RIGHT, padx=14)
+        self.btn_camera_toggle.pack(side=tk.RIGHT, padx=px(14))
 
         # 영상 영역 — 이미지 크기 계산은 상태바를 뺀 이 영역 기준으로 한다
         self.video_area = tk.Frame(self.camera_panel, bg="#0F172A")
         self.video_area.pack(fill=tk.BOTH, expand=True)
 
         self.video_label = tk.Label(self.video_area, bg="#0F172A")
-        self.video_label.pack(padx=10, pady=10, fill=tk.BOTH, expand=True)
+        self.video_label.pack(padx=px(10), pady=px(10), fill=tk.BOTH, expand=True)
 
         # 우측: 가변 상태 패널 컨테이너
-        self.right_container = tk.Frame(content_frame, width=RIGHT_PANEL_WIDTH, bg="#F1F5F9")
-        self.right_container.pack(side=tk.RIGHT, fill=tk.Y, expand=False, padx=(20, 0))
+        self.right_container = tk.Frame(content_frame, width=px(RIGHT_PANEL_WIDTH), bg="#F1F5F9")
+        self.right_container.pack(side=tk.RIGHT, fill=tk.Y, expand=False, padx=(px(20), 0))
         self.right_container.pack_propagate(False)
 
     def ai_worker(self):

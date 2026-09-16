@@ -20,6 +20,12 @@ RIGHT_PANEL_WIDTH = 620  # 우측 UI 패널 폭 — 1600x900 기준 값이고, �
 BASE_WIN_W, BASE_WIN_H = 1600, 900
 UI_SCALE = 1.0
 
+# 주간 출석 기준 — 월요일~일요일 동안 채워야 하는 시간/일수
+WEEKLY_REQUIRED_SECONDS = 20 * 3600
+WEEKLY_REQUIRED_DAYS = 3
+# 00:00~06:00 사이에 찍은 출근/퇴근은 무효. 06:00~24:00 사이 기록만 인정한다.
+VALID_ATTENDANCE_START = "06:00:00"
+
 
 def px(value):
     """1600x900 기준으로 잡은 픽셀 값을 현재 화면 배율에 맞춰 바꾼다."""
@@ -141,9 +147,27 @@ def pair_attendance_sessions(rows):
     return sessions
 
 
+def is_valid_attendance_time(log_time):
+    """06:00~24:00 사이에 찍은 기록인지. 00:00~06:00 사이 출근/퇴근은 무효로 본다."""
+    return bool(log_time) and log_time >= VALID_ATTENDANCE_START
+
+
+def format_duration(seconds):
+    """초를 'N시간 N분 N초' 형태로 바꾼다."""
+    seconds = int(max(0, seconds))
+    hours, rest = divmod(seconds, 3600)
+    minutes, secs = divmod(rest, 60)
+    return f"{hours}시간 {minutes:02d}분 {secs:02d}초"
+
+
 def session_seconds(session):
-    """출근~퇴근 사이 시간(초). 둘 중 하나라도 없거나 계산이 안 되면 0."""
+    """
+    출근~퇴근 사이 인정 시간(초).
+    출근/퇴근 중 하나라도 없거나, 00:00~06:00 사이에 찍은 기록이거나, 계산이 안 되면 0.
+    """
     if not (session["check_in"] and session["check_out"]):
+        return 0
+    if not (is_valid_attendance_time(session["check_in"]) and is_valid_attendance_time(session["check_out"])):
         return 0
     try:
         t_in = datetime.strptime(f"{session['date']} {session['check_in']}", "%Y-%m-%d %H:%M:%S")
@@ -293,11 +317,21 @@ def get_weekly_attendance_stats(user_id):
     logs = cursor.fetchall()
     conn.close()
 
-    # 하루에 여러 번 출퇴근할 수 있으니 출근→퇴근 한 쌍마다 시간을 더한다
-    total_seconds = sum(session_seconds(s) for s in pair_attendance_sessions(logs))
+    # 00:00~06:00 사이 출근/퇴근은 무효라서 아예 빼고 계산한다
+    valid_logs = [log for log in logs if is_valid_attendance_time(log[4])]
 
-    total_hours = round(total_seconds / 3600.0, 1)
-    return total_hours
+    # 출근 일수: 인정되는 출근 기록이 있는 날 (퇴근을 안 찍었어도 일수는 인정)
+    attended_days = len({log[2] for log in valid_logs if log[3] == "CHECK_IN"})
+
+    # 출근 시간: 출근→퇴근 한 쌍이 모두 있어야 인정 (하루 여러 번이면 모두 더한다)
+    total_seconds = int(sum(session_seconds(s) for s in pair_attendance_sessions(valid_logs)))
+
+    return {
+        "days": attended_days,
+        "seconds": total_seconds,
+        "missing_days": max(0, WEEKLY_REQUIRED_DAYS - attended_days),
+        "missing_seconds": max(0, WEEKLY_REQUIRED_SECONDS - total_seconds),
+    }
 
 def log_attendance(user_id, name, log_type):
     today_date = datetime.now().strftime("%Y-%m-%d")
@@ -316,6 +350,9 @@ def log_attendance(user_id, name, log_type):
     export_attendance_json()  # 창공시스템이 읽는 출결 파일도 즉시 갱신
 
     type_str = "출근" if log_type == 'CHECK_IN' else "퇴근"
+    if not is_valid_attendance_time(now_time):
+        return True, (f"{now_time} {type_str}이 기록되었습니다.\n"
+                      "단, 00:00~06:00 사이 출퇴근은 출석 일수와 시간에 인정되지 않습니다.")
     return True, f"{now_time} {type_str}이 확인 되었습니다."
 
 
@@ -419,17 +456,41 @@ class StudentInfoFrame(tk.Frame):
         lbl_stats_title = tk.Label(stats_frame, text="이번주 출석 현황", font=("맑은 고딕", 13, "bold"), bg="#F8FAFC", fg="#1E293B")
         lbl_stats_title.pack(anchor=tk.W, padx=px(15), pady=(px(12), px(8)))
 
-        weekly_hours = get_weekly_attendance_stats(student_info["user_id"])
-        
-        lbl_total = tk.Label(stats_frame, text=f"• total : {weekly_hours} 시간", font=("맑은 고딕", 11), bg="#F8FAFC", fg="#334155")
-        lbl_total.pack(anchor=tk.W, padx=px(25), pady=px(2))
+        weekly = get_weekly_attendance_stats(student_info["user_id"])
+
+        # 항목 / 이번주 기록 / 부족분을 표처럼 맞춰서 보여준다. 기준에 못 미친 부족분은 빨간색으로 강조.
+        stats_grid = tk.Frame(stats_frame, bg="#F8FAFC")
+        stats_grid.pack(anchor=tk.W, fill=tk.X, padx=px(25), pady=px(2))
+
+        def add_stat_row(row, title, value_text, missing_text):
+            tk.Label(stats_grid, text=f"• {title} :", font=("맑은 고딕", 11), bg="#F8FAFC", fg="#334155") \
+                .grid(row=row, column=0, sticky=tk.W, pady=px(2))
+            tk.Label(stats_grid, text=value_text, font=("맑은 고딕", 11, "bold"), bg="#F8FAFC", fg="#0F172A") \
+                .grid(row=row, column=1, sticky=tk.W, padx=(px(8), 0), pady=px(2))
+            if missing_text:
+                tk.Label(stats_grid, text=f"부족 {missing_text}", font=("맑은 고딕", 11, "bold"), bg="#F8FAFC", fg="#EF4444") \
+                    .grid(row=row + 1, column=1, sticky=tk.W, padx=(px(8), 0), pady=(0, px(4)))
+            else:
+                tk.Label(stats_grid, text="기준 충족", font=("맑은 고딕", 10, "bold"), bg="#F8FAFC", fg="#10B981") \
+                    .grid(row=row + 1, column=1, sticky=tk.W, padx=(px(8), 0), pady=(0, px(4)))
+
+        add_stat_row(
+            0, "출근 일수",
+            f"{weekly['days']}일 / {WEEKLY_REQUIRED_DAYS}일",
+            f"{weekly['missing_days']}일" if weekly["missing_days"] else "",
+        )
+        add_stat_row(
+            2, "출근 시간",
+            f"{format_duration(weekly['seconds'])} / {WEEKLY_REQUIRED_SECONDS // 3600}시간",
+            format_duration(weekly["missing_seconds"]) if weekly["missing_seconds"] else "",
+        )
 
         # 3진 아웃제 기준 패널티 색상 경고 표기
         penalty_val = student_info['penalty']
         penalty_color = "#EF4444" if penalty_val >= 2 else "#F59E0B" if penalty_val == 1 else "#10B981"
         
         penalty_container = tk.Frame(stats_frame, bg="#F8FAFC")
-        penalty_container.pack(anchor=tk.W, padx=px(25), pady=(px(2), px(12)))
+        penalty_container.pack(anchor=tk.W, padx=px(25), pady=(px(2), px(4)))
         
         lbl_penalty_bullet = tk.Label(penalty_container, text="• 패널티 현황 : ", font=("맑은 고딕", 11), bg="#F8FAFC", fg="#334155")
         lbl_penalty_bullet.pack(side=tk.LEFT)
@@ -437,18 +498,22 @@ class StudentInfoFrame(tk.Frame):
         lbl_penalty_value = tk.Label(penalty_container, text=f"{penalty_val}개", font=("맑은 고딕", 11, "bold"), bg="#F8FAFC", fg=penalty_color)
         lbl_penalty_value.pack(side=tk.LEFT)
 
+        lbl_rule = tk.Label(
+            stats_frame, text="06:00~24:00 출퇴근만 인정 · 퇴근을 찍어야 시간 인정",
+            font=("맑은 고딕", 9), bg="#F8FAFC", fg="#94A3B8"
+        )
+        lbl_rule.pack(anchor=tk.W, padx=px(25), pady=(0, px(12)))
+
         # 학생 프로필 정보 박스
         profile_frame = tk.Frame(self, bg="white", bd=1, relief=tk.SOLID)
         profile_frame.pack(fill=tk.BOTH, expand=True, padx=px(15), pady=px(10))
-
-        name_masked = student_info["name"][0] + "o" * (len(student_info["name"]) - 1)
 
         info_inner = tk.Frame(profile_frame, bg="white")
         info_inner.pack(padx=px(20), pady=px(20), fill=tk.BOTH, expand=True)
 
         lbl_name_tag = tk.Label(info_inner, text="이름", font=("맑은 고딕", 9, "bold"), bg="white", fg="#94A3B8")
         lbl_name_tag.pack(anchor=tk.W, pady=(0, 1))
-        lbl_name = tk.Label(info_inner, text=name_masked, font=("맑은 고딕", 14, "bold"), bg="white", fg="#0F172A")
+        lbl_name = tk.Label(info_inner, text=student_info["name"], font=("맑은 고딕", 14, "bold"), bg="white", fg="#0F172A")
         lbl_name.pack(anchor=tk.W, pady=(0, 12))
 
         lbl_id_tag = tk.Label(info_inner, text="학번", font=("맑은 고딕", 9, "bold"), bg="white", fg="#94A3B8")

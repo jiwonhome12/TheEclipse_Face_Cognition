@@ -5,12 +5,12 @@ import time
 import sqlite3
 import json
 import os
+import multiprocessing
 from datetime import datetime, timedelta
 import tkinter as tk
 from tkinter import ttk, messagebox, simpledialog, filedialog
 from tkinter import font as tkfont
 from PIL import Image, ImageDraw, ImageFont, ImageTk
-from insightface.app import FaceAnalysis
 
 DB_PATH = "faces.db"
 THRESHOLD = 0.50
@@ -25,6 +25,51 @@ WEEKLY_REQUIRED_SECONDS = 20 * 3600
 WEEKLY_REQUIRED_DAYS = 3
 # 00:00~06:00 사이에 찍은 출근/퇴근은 무효. 06:00~24:00 사이 기록만 인정한다.
 VALID_ATTENDANCE_START = "06:00:00"
+
+# 얼굴 인식에 쓸 CPU 스레드 수. 12스레드(6코어)에서 측정: 6개면 화면이 27fps로 끊기고 4개면 29fps.
+INFERENCE_THREADS = max(2, (os.cpu_count() or 4) // 3)
+
+
+# ==========================================
+# 0-0. 얼굴 인식 전용 프로세스
+# ==========================================
+# 같은 프로세스의 스레드에서 추론을 돌리면 파이썬 GIL과 CPU를 화면 그리기와 나눠 써서
+# 카메라 화면이 뚝뚝 끊겼다(측정: 인식 끄면 29.6fps, 켜면 25~27fps + 50ms 이상 멈춤 다수).
+# 별도 프로세스로 분리하면 UI 프로세스는 그리기만 한다.
+class DetectedFace:
+    __slots__ = ("bbox", "embedding")
+
+    def __init__(self, bbox, embedding):
+        self.bbox = bbox
+        self.embedding = embedding
+
+
+def face_inference_process(conn, threads):
+    import onnxruntime
+    from insightface.app import FaceAnalysis
+
+    app = FaceAnalysis(
+        name="buffalo_l",
+        allowed_modules=['detection', 'recognition'],
+        providers=["CPUExecutionProvider"]
+    )
+    app.prepare(ctx_id=0, det_size=(256, 256))
+
+    # onnxruntime은 기본으로 CPU 코어를 전부 써서 카메라/화면 쪽이 밀린다.
+    # insightface는 세션 옵션을 넘겨받지 않으므로 같은 모델 파일로 세션만 다시 만든다.
+    opts = onnxruntime.SessionOptions()
+    opts.intra_op_num_threads = threads
+    opts.inter_op_num_threads = 1
+    for model in app.models.values():
+        model.session = onnxruntime.InferenceSession(
+            model.session.model_path, sess_options=opts, providers=["CPUExecutionProvider"]
+        )
+
+    conn.send("ready")
+    while True:
+        frame = conn.recv()
+        faces = app.get(frame)
+        conn.send([(f.bbox, f.embedding) for f in faces])
 
 
 def px(value):
@@ -1222,13 +1267,12 @@ class AttendanceApp:
         # 창공시스템이 항상 최신 출결 데이터를 읽어갈 수 있도록 시작할 때도 한 번 내보낸다
         export_attendance_json()
 
-        # InsightFace 초기화
-        self.app = FaceAnalysis(
-            name="buffalo_l",
-            allowed_modules=['detection', 'recognition'],
-            providers=["CPUExecutionProvider"]
+        # InsightFace는 별도 프로세스에서 로드/실행한다 (face_inference_process 참고)
+        self.face_conn, child_conn = multiprocessing.Pipe()
+        self.face_proc = multiprocessing.Process(
+            target=face_inference_process, args=(child_conn, INFERENCE_THREADS), daemon=True
         )
-        self.app.prepare(ctx_id=0, det_size=(256, 256))
+        self.face_proc.start()
         self.enrolled_users = load_users()
         self.embed_matrix = None
         self._rebuild_embedding_matrix()
@@ -1252,16 +1296,28 @@ class AttendanceApp:
         # 기본 화면으로 전환
         self.reset_to_default_view()
 
-        # 웹캠 기동
-        self.cap = cv2.VideoCapture(0)
+        # 웹캠 기동 — DSHOW는 MSMF와 FPS는 같고 여는 속도가 훨씬 빠르다
+        self.cap = cv2.VideoCapture(0, cv2.CAP_DSHOW)
         self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
         self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
+        self.cap.set(cv2.CAP_PROP_FPS, 30)
+        self.cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)  # 밀린 옛 프레임 대신 항상 최신 프레임
 
         self.latest_frame = None
+        self.frame_seq = 0          # 캡처 스레드가 새 프레임을 받을 때마다 1씩 증가
         self.cached_faces = []
         self.is_running = True
 
-        # 비디오 리프레시 및 추론 백그라운드
+        # 화면 그리기 상태 (PhotoImage를 매 프레임 새로 만들지 않고 재사용한다)
+        self._photo = None
+        self._rendered_seq = -1
+        self._fps_count = 0
+        self._fps_since = time.perf_counter()
+
+        # 카메라 읽기(cap.read는 다음 프레임이 올 때까지 최대 33ms 블로킹)와 인식 결과 주고받기는
+        # 각자 백그라운드 스레드에서 돌리고, UI 스레드는 그리기만 한다
+        self.capture_thread = threading.Thread(target=self.capture_worker, daemon=True)
+        self.capture_thread.start()
         self.ai_thread = threading.Thread(target=self.ai_worker, daemon=True)
         self.ai_thread.start()
 
@@ -1329,110 +1385,148 @@ class AttendanceApp:
         self.right_container.pack(side=tk.RIGHT, fill=tk.Y, expand=False, padx=(px(20), 0))
         self.right_container.pack_propagate(False)
 
-    def ai_worker(self):
+    def capture_worker(self):
+        """카메라에서 프레임을 계속 받아 최신 1장만 보관한다 (화면을 꺼둔 동안은 읽지 않는다)."""
         while self.is_running:
-            if self.camera_on and self.latest_frame is not None:
-                # 관리자 탭에서도 학생 신규 등록을 위해 인물 스캔 연산은 항상 유지
-                frame_to_process = self.latest_frame.copy()
-                faces = self.app.get(frame_to_process)
-                self.cached_faces = faces
-            time.sleep(0.04)
+            if not self.camera_on:
+                time.sleep(0.05)
+                continue
+            ret, frame = self.cap.read()
+            if not ret:
+                time.sleep(0.01)
+                continue
+            self.latest_frame = cv2.flip(frame, 1)
+            self.frame_seq += 1
+
+    def ai_worker(self):
+        """최신 프레임을 인식 프로세스로 보내고 결과를 받아온다 (한 번에 1장씩만 보내서 밀리지 않게)."""
+        try:
+            self.face_conn.recv()  # 인식 프로세스의 모델 로딩 완료 신호
+            last_seq = -1
+            while self.is_running:
+                frame = self.latest_frame
+                seq = self.frame_seq
+                # 같은 프레임을 두 번 분석하지 않는다 (관리자 탭에서도 학생 등록용 스캔은 계속 유지)
+                if self.camera_on and frame is not None and seq != last_seq:
+                    last_seq = seq
+                    self.face_conn.send(frame)
+                    results = self.face_conn.recv()
+                    if self.camera_on:  # 분석 중에 화면을 껐다면 예전 얼굴을 남기지 않는다
+                        self.cached_faces = [DetectedFace(bbox, emb) for bbox, emb in results]
+                else:
+                    time.sleep(0.005)
+        except (EOFError, OSError):
+            pass  # 프로그램 종료로 인식 프로세스가 닫힌 경우
 
     def update_video(self):
-        # 화면을 꺼둔 동안은 프레임을 읽지도, 얼굴을 인식하지도 않는다
-        ret = False
-        if self.camera_on:
-            ret, frame = self.cap.read()
+        frame = self.latest_frame
+        seq = self.frame_seq
 
-        if ret:
-            frame = cv2.flip(frame, 1)
-            self.latest_frame = frame
-            display = frame.copy()
-
-            best_user = None
-            best_sim = -1.0
-            # 사각형은 cv2로 그대로 그리고, 글자(한글)는 아래에서 PIL로 한 번에 그린다.
-            # cv2.putText는 Hershey 폰트만 지원해서 한글을 못 그려 '?'로 깨져 보이는 문제가 있었다.
-            labels_to_draw = []  # (x, y, text, RGB색상)
-
-            # 얼굴 바운딩 박스 렌더링 (등록된 전원과의 유사도를 행렬곱으로 한번에 계산)
-            if self.cached_faces:
-                face_embs = np.asarray([f.embedding for f in self.cached_faces], dtype=np.float32)
-                face_norms = np.linalg.norm(face_embs, axis=1, keepdims=True)
-                face_norms[face_norms == 0] = 1.0
-                face_embs_normed = face_embs / face_norms
-
-                has_users = self.embed_matrix is not None and len(self.embed_matrix) > 0
-                if has_users:
-                    sims = face_embs_normed @ self.embed_matrix.T  # (num_faces, num_users)
-                    match_idx = np.argmax(sims, axis=1)
-                    match_sims = sims[np.arange(len(self.cached_faces)), match_idx]
-
-                for i, face in enumerate(self.cached_faces):
-                    bbox = face.bbox.astype(int)
-                    sim = float(match_sims[i]) if has_users else -1.0
-                    user = self.enrolled_users[match_idx[i]] if has_users else None
-
-                    # 테두리 및 텍스트 렌더링을 깔끔하게 개선
-                    if sim >= THRESHOLD and user:
-                        # 이름은 창공시스템 명단(roster.json)을 우선 쓴다 — 새로고침하면 바로 반영된다.
-                        display_name = self._resolve_display_name(user)
-                        label = f"{display_name} ({sim:.2f})"
-                        color_bgr = (16, 185, 129)  # Neon Green (#10B981)
-                    else:
-                        label = "UNKNOWN"
-                        color_bgr = (239, 68, 68)  # Rose Red (#EF4444)
-
-                    cv2.rectangle(display, (bbox[0], bbox[1]), (bbox[2], bbox[3]), color_bgr, 2)
-                    label_x, label_y = int(bbox[0]), max(0, int(bbox[1]) - 26)
-                    color_rgb = (color_bgr[2], color_bgr[1], color_bgr[0])
-                    labels_to_draw.append((label_x, label_y, label, color_rgb))
-
-                    if sim > best_sim:
-                        best_sim = sim
-                        best_user = user
-
-            # 관리자가 로그인하지 않았고, 학생 화면에서 [관리자]를 눌러 로그인 중도 아닐 때만
-            # 얼굴 인식 결과로 화면을 자동으로 바꾼다 (안 그러면 로그인 화면이 자꾸 밀려난다)
-            if not self.admin_logged_in and not self.admin_login_requested:
-                if best_sim >= THRESHOLD and best_user:
-                    self.last_face_time = time.time()
-                    # 새로운 사용자를 보았을 때 화면 카드 교환
-                    if self.current_student_id != best_user["user_id"]:
-                        self.current_student_id = best_user["user_id"]
-                        # 표시용 이름은 최신 창공시스템 명단을 우선한다
-                        shown_user = dict(best_user)
-                        shown_user["name"] = self._resolve_display_name(best_user)
-                        self.show_student_view(shown_user)
-                else:
-                    # 감지된 얼굴이 없으면 4초 카운트 다운 후 기본 관리자 로그인 카드로 복귀
-                    if self.current_view_state == "student":
-                        if time.time() - self.last_face_time > 4.0:
-                            self.reset_to_default_view()
-
-            cv2image = cv2.cvtColor(display, cv2.COLOR_BGR2RGB)
-            img = Image.fromarray(cv2image)
-
-            # 얼굴마다 이름을 한 번씩만, 한글이 제대로 보이게 PIL로 그린다
-            if labels_to_draw:
-                draw = ImageDraw.Draw(img)
-                font = get_korean_font(18)
-                for label_x, label_y, text, color_rgb in labels_to_draw:
-                    draw.text((label_x + 1, label_y + 1), text, font=font, fill=(0, 0, 0))  # 가독성용 그림자
-                    draw.text((label_x, label_y), text, font=font, fill=color_rgb)
-
-            # 영상 영역에 비율을 유지하며 카메라 화면을 축소/확대한다 (화면 밖으로 안 나가게)
-            panel_w = self.video_area.winfo_width()
-            panel_h = self.video_area.winfo_height()
-            if panel_w > 20 and panel_h > 20:
-                img = self._fit_image_to_panel(img, panel_w - 20, panel_h - 20)
-
-            imgtk = ImageTk.PhotoImage(image=img)
-            self.video_label.imgtk = imgtk
-            self.video_label.configure(image=imgtk)
+        # 새 프레임이 들어왔을 때만 그린다 — 같은 프레임을 다시 그리는 CPU 낭비 방지
+        if self.camera_on and frame is not None and seq != self._rendered_seq:
+            self._rendered_seq = seq
+            self._render_frame(frame)
 
         if self.is_running:
-            self.window.after(20, self.update_video)
+            self.window.after(5, self.update_video)
+
+    def _render_frame(self, frame):
+        # 표시 크기로 먼저 줄이고 그 위에 박스/글자를 그린다 (PIL LANCZOS 11ms → cv2 1ms)
+        panel_w = self.video_area.winfo_width() - 20
+        panel_h = self.video_area.winfo_height() - 20
+        src_h, src_w = frame.shape[:2]
+        scale = min(panel_w / src_w, panel_h / src_h) if panel_w > 0 and panel_h > 0 else 1.0
+        scale = max(scale, 0.1)
+        out_w, out_h = max(1, int(src_w * scale)), max(1, int(src_h * scale))
+        display = cv2.resize(frame, (out_w, out_h), interpolation=cv2.INTER_LINEAR)
+
+        best_user = None
+        best_sim = -1.0
+        # 사각형은 cv2로 그대로 그리고, 글자(한글)는 아래에서 PIL로 한 번에 그린다.
+        # cv2.putText는 Hershey 폰트만 지원해서 한글을 못 그려 '?'로 깨져 보이는 문제가 있었다.
+        labels_to_draw = []  # (x, y, text, RGB색상)
+
+        # 얼굴 바운딩 박스 렌더링 (등록된 전원과의 유사도를 행렬곱으로 한번에 계산)
+        faces = self.cached_faces
+        if faces:
+            face_embs = np.asarray([f.embedding for f in faces], dtype=np.float32)
+            face_norms = np.linalg.norm(face_embs, axis=1, keepdims=True)
+            face_norms[face_norms == 0] = 1.0
+            face_embs_normed = face_embs / face_norms
+
+            has_users = self.embed_matrix is not None and len(self.embed_matrix) > 0
+            if has_users:
+                sims = face_embs_normed @ self.embed_matrix.T  # (num_faces, num_users)
+                match_idx = np.argmax(sims, axis=1)
+                match_sims = sims[np.arange(len(faces)), match_idx]
+
+            for i, face in enumerate(faces):
+                x1, y1, x2, y2 = (face.bbox * scale).astype(int)  # 원본 좌표 → 표시 크기 좌표
+                sim = float(match_sims[i]) if has_users else -1.0
+                user = self.enrolled_users[match_idx[i]] if has_users else None
+
+                if sim >= THRESHOLD and user:
+                    # 이름은 창공시스템 명단(roster.json)을 우선 쓴다 — 새로고침하면 바로 반영된다.
+                    display_name = self._resolve_display_name(user)
+                    label = f"{display_name} ({sim:.2f})"
+                    color_bgr = (16, 185, 129)  # Neon Green (#10B981)
+                else:
+                    label = "UNKNOWN"
+                    color_bgr = (239, 68, 68)  # Rose Red (#EF4444)
+
+                cv2.rectangle(display, (x1, y1), (x2, y2), color_bgr, 2)
+                color_rgb = (color_bgr[2], color_bgr[1], color_bgr[0])
+                labels_to_draw.append((x1, max(0, y1 - 28), label, color_rgb))
+
+                if sim > best_sim:
+                    best_sim = sim
+                    best_user = user
+
+        # 관리자가 로그인하지 않았고, 학생 화면에서 [관리자]를 눌러 로그인 중도 아닐 때만
+        # 얼굴 인식 결과로 화면을 자동으로 바꾼다 (안 그러면 로그인 화면이 자꾸 밀려난다)
+        if not self.admin_logged_in and not self.admin_login_requested:
+            if best_sim >= THRESHOLD and best_user:
+                self.last_face_time = time.time()
+                # 새로운 사용자를 보았을 때 화면 카드 교환
+                if self.current_student_id != best_user["user_id"]:
+                    self.current_student_id = best_user["user_id"]
+                    # 표시용 이름은 최신 창공시스템 명단을 우선한다
+                    shown_user = dict(best_user)
+                    shown_user["name"] = self._resolve_display_name(best_user)
+                    self.show_student_view(shown_user)
+            else:
+                # 감지된 얼굴이 없으면 4초 카운트 다운 후 기본 관리자 로그인 카드로 복귀
+                if self.current_view_state == "student":
+                    if time.time() - self.last_face_time > 4.0:
+                        self.reset_to_default_view()
+
+        img = Image.fromarray(cv2.cvtColor(display, cv2.COLOR_BGR2RGB))
+
+        # 얼굴마다 이름을 한 번씩만, 한글이 제대로 보이게 PIL로 그린다
+        if labels_to_draw:
+            draw = ImageDraw.Draw(img)
+            font = get_korean_font(px(20))
+            for label_x, label_y, text, color_rgb in labels_to_draw:
+                draw.text((label_x + 1, label_y + 1), text, font=font, fill=(0, 0, 0))  # 가독성용 그림자
+                draw.text((label_x, label_y), text, font=font, fill=color_rgb)
+
+        # PhotoImage는 크기가 같으면 새로 만들지 않고 픽셀만 덮어쓴다 (20ms → 9ms)
+        if self._photo is None or (self._photo.width(), self._photo.height()) != img.size:
+            self._photo = ImageTk.PhotoImage(image=img)
+            self.video_label.configure(image=self._photo)
+        else:
+            self._photo.paste(img)
+
+        self._update_fps_label()
+
+    def _update_fps_label(self):
+        self._fps_count += 1
+        now = time.perf_counter()
+        elapsed = now - self._fps_since
+        if elapsed >= 1.0:
+            self.lbl_cam_status.config(text=f"● LIVE  {self._fps_count / elapsed:.0f} fps", fg="#10B981")
+            self._fps_count = 0
+            self._fps_since = now
 
     def toggle_camera(self):
         """카메라 화면 표시를 켜고 끈다. 꺼져 있는 동안은 얼굴 인식도 같이 멈춘다."""
@@ -1442,6 +1536,8 @@ class AttendanceApp:
             self.lbl_cam_status.config(text="● LIVE", fg="#10B981")
             self.btn_camera_toggle.config(text="📷 화면 끄기")
             self.video_label.config(text="")
+            self._fps_count = 0
+            self._fps_since = time.perf_counter()
             return
 
         self.latest_frame = None
@@ -1450,7 +1546,7 @@ class AttendanceApp:
 
         self.lbl_cam_status.config(text="● OFF", fg="#EF4444")
         self.btn_camera_toggle.config(text="📷 화면 켜기")
-        self.video_label.imgtk = None
+        self._photo = None
         self.video_label.config(
             image="", text="📷\n\n카메라 화면이 꺼져 있습니다\n[화면 켜기]를 누르면 다시 표시됩니다",
             fg="#64748B", font=("맑은 고딕", 14, "bold")
@@ -1465,19 +1561,6 @@ class AttendanceApp:
             return
         self.lbl_clock.config(text=datetime.now().strftime("%Y-%m-%d  %H:%M:%S"))
         self.window.after(1000, self._update_clock)
-
-    @staticmethod
-    def _fit_image_to_panel(img, max_w, max_h):
-        """가로세로 비율을 유지하면서 주어진 영역 안에 들어오도록 이미지를 맞춘다."""
-        if max_w <= 0 or max_h <= 0:
-            return img
-        w, h = img.size
-        if w == 0 or h == 0:
-            return img
-        scale = min(max_w / w, max_h / h)
-        scale = max(scale, 0.1)  # 극단적으로 작아지는 것만 방지
-        new_size = (max(1, int(w * scale)), max(1, int(h * scale)))
-        return img.resize(new_size, Image.LANCZOS)
 
     def _rebuild_embedding_matrix(self):
         # 정규화된 임베딩을 미리 쌓아두면 프레임마다 norm을 다시 계산하지 않고
@@ -1563,7 +1646,9 @@ class AttendanceApp:
 
     def on_close(self):
         self.is_running = False
+        self.capture_thread.join(timeout=1.0)  # 읽는 도중에 release하면 드라이버가 멈출 수 있다
         self.cap.release()
+        self.face_proc.terminate()
         self.window.destroy()
 
 
@@ -1571,6 +1656,7 @@ class AttendanceApp:
 # 4. 앱 실행
 # ==========================================
 if __name__ == "__main__":
+    multiprocessing.freeze_support()  # exe로 패키징해도 인식 프로세스가 앱을 다시 띄우지 않게
     root = tk.Tk()
     app = AttendanceApp(root)
     root.protocol("WM_DELETE_WINDOW", app.on_close)

@@ -6,7 +6,8 @@ import sqlite3
 import json
 import os
 import multiprocessing
-from datetime import datetime, timedelta
+import calendar
+from datetime import date, datetime, timedelta
 import tkinter as tk
 from tkinter import ttk, messagebox, simpledialog, filedialog
 from tkinter import font as tkfont
@@ -345,6 +346,51 @@ def load_users():
         })
     return users
 
+def summarize_attendance(logs):
+    """
+    (user_id, name, log_date, log_type, log_time) 기록으로 (출근 일수, 인정 시간 초)를 구한다.
+    학생 화면의 주간 현황과 관리자 출결로그 필터가 같은 규칙을 쓰도록 여기 한 곳에서 계산한다.
+    """
+    # 00:00~06:00 사이 출근/퇴근은 무효라서 아예 빼고 계산한다
+    valid_logs = [log for log in logs if is_valid_attendance_time(log[4])]
+
+    # 출근 일수: 인정되는 출근 기록이 있는 날 (퇴근을 안 찍었어도 일수는 인정)
+    attended_days = len({log[2] for log in valid_logs if log[3] == "CHECK_IN"})
+
+    # 출근 시간: 출근→퇴근 한 쌍이 모두 있어야 인정 (하루 여러 번이면 모두 더한다)
+    total_seconds = int(sum(session_seconds(s) for s in pair_attendance_sessions(valid_logs)))
+    return attended_days, total_seconds
+
+
+def get_attendance_summary_by_student(start_date, end_date):
+    """기간(YYYY-MM-DD, 양 끝 포함) 안의 학생별 출근 일수와 인정 시간. 기록이 없는 등록 학생도 0으로 넣는다."""
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    cursor.execute("SELECT user_id, name FROM users WHERE role = 'student'")
+    names = {str(user_id): name for user_id, name in cursor.fetchall()}
+    cursor.execute("""
+        SELECT user_id, name, log_date, log_type, log_time
+        FROM attendance_logs
+        WHERE log_date BETWEEN ? AND ?
+    """, (start_date, end_date))
+    logs = cursor.fetchall()
+    conn.close()
+
+    logs_by_user = {}
+    for log in logs:
+        if not log[0]:
+            continue
+        user_id = str(log[0])
+        logs_by_user.setdefault(user_id, []).append(log)
+        names.setdefault(user_id, log[1])  # 삭제된 학생의 기록도 이름과 함께 보여준다
+
+    summary = []
+    for user_id, name in names.items():
+        days, seconds = summarize_attendance(logs_by_user.get(user_id, []))
+        summary.append({"user_id": user_id, "name": name or "", "days": days, "seconds": seconds})
+    return summary
+
+
 def get_weekly_attendance_stats(user_id):
     # 이번주 월요일 00:00:00부터 일요일 23:59:59까지의 출석 계산
     today = datetime.now()
@@ -362,14 +408,7 @@ def get_weekly_attendance_stats(user_id):
     logs = cursor.fetchall()
     conn.close()
 
-    # 00:00~06:00 사이 출근/퇴근은 무효라서 아예 빼고 계산한다
-    valid_logs = [log for log in logs if is_valid_attendance_time(log[4])]
-
-    # 출근 일수: 인정되는 출근 기록이 있는 날 (퇴근을 안 찍었어도 일수는 인정)
-    attended_days = len({log[2] for log in valid_logs if log[3] == "CHECK_IN"})
-
-    # 출근 시간: 출근→퇴근 한 쌍이 모두 있어야 인정 (하루 여러 번이면 모두 더한다)
-    total_seconds = int(sum(session_seconds(s) for s in pair_attendance_sessions(valid_logs)))
+    attended_days, total_seconds = summarize_attendance(logs)
 
     return {
         "days": attended_days,
@@ -404,6 +443,145 @@ def log_attendance(user_id, name, log_type):
 # ==========================================
 # 2. UI 상태 프레임 정의
 # ==========================================
+
+WEEKDAY_KO = ["월", "화", "수", "목", "금", "토", "일"]
+
+
+def format_date_ko(d):
+    return f"{d:%Y-%m-%d} ({WEEKDAY_KO[d.weekday()]})"
+
+
+class DatePicker(tk.Button):
+    """누르면 달력이 펼쳐지고, 날짜를 고르면 값이 바뀌는 버튼. (tkcalendar 같은 추가 설치 없이 동작)"""
+
+    def __init__(self, master, initial, on_change=None):
+        super().__init__(
+            master, bg="white", fg="#0F172A", activebackground="#F1F5F9", relief=tk.SOLID, bd=1,
+            font=("맑은 고딕", 10), padx=px(8), pady=px(2), cursor="hand2", command=self.toggle_calendar
+        )
+        self.on_change = on_change
+        self.popup = None
+        self.set_date(initial)
+
+    def get_date(self):
+        return self._date
+
+    def set_date(self, value):
+        self._date = value
+        self.config(text=f"📅 {format_date_ko(value)}")
+
+    def toggle_calendar(self):
+        if self.popup is not None:
+            self.close_calendar()
+            return
+
+        self.popup = tk.Toplevel(self)
+        self.popup.overrideredirect(True)
+        self.popup.configure(bg="#CBD5E1")  # 바깥 1px 테두리
+        self.body = tk.Frame(self.popup, bg="white")
+        self.body.pack(padx=1, pady=1)
+
+        self._view_year, self._view_month = self._date.year, self._date.month
+        self._render_month()
+        self._place_popup()
+
+        # 달력 밖을 누르면 닫는다 — grab 중에는 창 밖 클릭도 이 팝업으로 전달된다
+        self.popup.grab_set()
+        self.popup.bind("<ButtonPress-1>", self._on_click)
+        self.popup.bind("<Escape>", lambda e: self.close_calendar())
+        self.popup.focus_set()
+
+    def close_calendar(self):
+        if self.popup is not None:
+            self.popup.grab_release()
+            self.popup.destroy()
+            self.popup = None
+
+    def _place_popup(self):
+        self.popup.update_idletasks()
+        x = self.winfo_rootx()
+        y = self.winfo_rooty() + self.winfo_height() + 2
+        # 화면 아래/오른쪽으로 넘치면 안쪽으로 당긴다
+        if y + self.popup.winfo_reqheight() > self.winfo_screenheight():
+            y = self.winfo_rooty() - self.popup.winfo_reqheight() - 2
+        x = min(x, self.winfo_screenwidth() - self.popup.winfo_reqwidth())
+        self.popup.geometry(f"+{max(0, x)}+{max(0, y)}")
+
+    def _on_click(self, event):
+        p = self.popup
+        inside = (p.winfo_rootx() <= event.x_root < p.winfo_rootx() + p.winfo_width()
+                  and p.winfo_rooty() <= event.y_root < p.winfo_rooty() + p.winfo_height())
+        if not inside:
+            self.close_calendar()
+
+    def _shift_month(self, delta):
+        index = self._view_month - 1 + delta
+        self._view_year += index // 12
+        self._view_month = index % 12 + 1
+        self._render_month()
+
+    def _pick(self, value):
+        self.close_calendar()
+        self.set_date(value)
+        if self.on_change:
+            self.on_change()
+
+    def _render_month(self):
+        for widget in self.body.winfo_children():
+            widget.destroy()
+
+        header = tk.Frame(self.body, bg="white")
+        header.grid(row=0, column=0, columnspan=7, sticky=tk.EW, pady=(px(6), px(4)))
+        nav_style = dict(bg="white", fg="#334155", activebackground="#E2E8F0", bd=0,
+                         font=("맑은 고딕", 11, "bold"), cursor="hand2", padx=px(8))
+        tk.Button(header, text="◀", command=lambda: self._shift_month(-1), **nav_style).pack(side=tk.LEFT, padx=px(4))
+        tk.Button(header, text="▶", command=lambda: self._shift_month(1), **nav_style).pack(side=tk.RIGHT, padx=px(4))
+        tk.Label(header, text=f"{self._view_year}년 {self._view_month}월", bg="white", fg="#0F172A",
+                 font=("맑은 고딕", 11, "bold")).pack(side=tk.LEFT, expand=True)
+
+        for col, name in enumerate(WEEKDAY_KO):
+            color = "#EF4444" if col == 6 else "#3B82F6" if col == 5 else "#64748B"
+            tk.Label(self.body, text=name, bg="white", fg=color, width=4,
+                     font=("맑은 고딕", 9, "bold")).grid(row=1, column=col, pady=(0, px(2)))
+
+        today = date.today()
+        weeks = calendar.Calendar(firstweekday=0).monthdatescalendar(self._view_year, self._view_month)
+        for row, week in enumerate(weeks, start=2):
+            for col, day in enumerate(week):
+                selected = day == self._date
+                is_today = day == today
+                if selected:
+                    bg, fg = "#3B82F6", "white"
+                elif day.month != self._view_month:
+                    bg, fg = "white", "#CBD5E1"
+                else:
+                    bg = "#DBEAFE" if is_today else "white"
+                    fg = "#EF4444" if col == 6 else "#3B82F6" if col == 5 else "#0F172A"
+                tk.Button(
+                    self.body, text=str(day.day), width=4, bg=bg, fg=fg, bd=0, relief=tk.FLAT,
+                    activebackground="#BFDBFE", cursor="hand2",
+                    font=("맑은 고딕", 10, "bold" if (selected or is_today) else "normal"),
+                    command=lambda d=day: self._pick(d)
+                ).grid(row=row, column=col, padx=1, pady=1)
+
+        tk.Button(
+            self.body, text=f"오늘 ({format_date_ko(today)})", bg="#F1F5F9", fg="#334155", bd=0,
+            activebackground="#E2E8F0", font=("맑은 고딕", 9, "bold"), cursor="hand2",
+            command=lambda: self._pick(today)
+        ).grid(row=len(weeks) + 2, column=0, columnspan=7, sticky=tk.EW, padx=px(6), pady=px(6))
+
+
+# 전체 출결로그 조회 유형 — (키, 화면에 보이는 이름)
+LOG_FILTER_MODES = [
+    ("today", "오늘 내역"),
+    ("recent7", "최근 7일 내역"),
+    ("recent7_sum", "최근 7일 합계 (학생별)"),
+    ("month", "월 단위 내역"),
+    ("week_days", f"주 {WEEKLY_REQUIRED_DAYS}회 이상 출석한 학생 (월~일)"),
+    ("week_hours", f"주 {WEEKLY_REQUIRED_SECONDS // 3600}시간 이상 출석한 학생 (월~일)"),
+    ("custom", "기간 직접 선택 (내역)"),
+]
+LOG_SUMMARY_MODES = {"recent7_sum", "week_days", "week_hours"}
 
 class AdminLoginFrame(tk.Frame):
     """ 두번째 이미지: 기본 화면 (관리자 로그인 기능) """
@@ -963,62 +1141,116 @@ class AdminDashboardFrame(tk.Frame):
             self.add_major.insert(0, student.get("Department", ""))
 
     def build_logs_tab(self):
-        # 상단 필터/검색 영역 바
-        filter_frame = ttk.LabelFrame(self.tab_logs, text=" 기간 및 학생 검색 조건 ")
+        # 상단 조회 조건
+        filter_frame = ttk.LabelFrame(self.tab_logs, text=" 조회 조건 ")
         filter_frame.pack(fill=tk.X, padx=5, pady=5)
+        filter_frame.columnconfigure(1, weight=1)
 
-        # 기본 기간을 오늘 기준으로 세팅
-        today_str = datetime.now().strftime("%Y-%m-%d")
-        week_ago_str = (datetime.now() - timedelta(days=7)).strftime("%Y-%m-%d")
+        # 1행: 조회 유형
+        ttk.Label(filter_frame, text="조회 유형:").grid(row=0, column=0, padx=5, pady=5, sticky=tk.W)
+        self.cmb_log_mode = ttk.Combobox(
+            filter_frame, state="readonly", font=("맑은 고딕", 10),
+            values=[label for _, label in LOG_FILTER_MODES]
+        )
+        self.cmb_log_mode.current(1)  # 기본: 최근 7일 내역
+        self.cmb_log_mode.grid(row=0, column=1, columnspan=2, padx=5, pady=5, sticky=tk.EW)
+        self.cmb_log_mode.bind("<<ComboboxSelected>>", lambda e: self.on_log_mode_changed())
 
-        ttk.Label(filter_frame, text="시작일:").grid(row=0, column=0, padx=5, pady=5, sticky=tk.W)
-        self.ent_start_date = ttk.Entry(filter_frame, width=10)
-        self.ent_start_date.insert(0, week_ago_str)
-        self.ent_start_date.grid(row=0, column=1, padx=5, pady=5)
+        # 2행: 날짜 (조회 유형에 따라 달력 버튼 개수/의미가 바뀐다)
+        self.lbl_log_date = ttk.Label(filter_frame, text="기간:")
+        self.lbl_log_date.grid(row=1, column=0, padx=5, pady=5, sticky=tk.W)
 
-        ttk.Label(filter_frame, text="종료일:").grid(row=0, column=2, padx=5, pady=5, sticky=tk.W)
-        self.ent_end_date = ttk.Entry(filter_frame, width=10)
-        self.ent_end_date.insert(0, today_str)
-        self.ent_end_date.grid(row=0, column=3, padx=5, pady=5)
+        date_row = ttk.Frame(filter_frame)
+        date_row.grid(row=1, column=1, columnspan=2, padx=5, pady=5, sticky=tk.W)
+        today = date.today()
+        self.date_start = DatePicker(date_row, today - timedelta(days=6), on_change=self.load_logs_filtered)
+        self.date_start.grid(row=0, column=0)
+        self.lbl_date_tilde = ttk.Label(date_row, text="~")
+        self.lbl_date_tilde.grid(row=0, column=1, padx=px(6))
+        self.date_end = DatePicker(date_row, today, on_change=self.load_logs_filtered)
+        self.date_end.grid(row=0, column=2)
+        self.lbl_log_range = ttk.Label(date_row, text="", foreground="#475569", font=("맑은 고딕", 10, "bold"))
+        self.lbl_log_range.grid(row=0, column=3, padx=(px(8), 0))
 
-        ttk.Label(filter_frame, text="이름 검색:").grid(row=0, column=4, padx=5, pady=5, sticky=tk.W)
-        self.ent_search_name = ttk.Entry(filter_frame, width=9)
-        self.ent_search_name.grid(row=0, column=5, padx=5, pady=5)
+        # 3행: 이름/학번 검색 + 조회
+        ttk.Label(filter_frame, text="이름/학번:").grid(row=2, column=0, padx=5, pady=5, sticky=tk.W)
+        self.ent_search_name = ttk.Entry(filter_frame, width=16)
+        self.ent_search_name.grid(row=2, column=1, padx=5, pady=5, sticky=tk.W)
+        self.ent_search_name.bind("<Return>", lambda e: self.load_logs_filtered())
 
-        # 조회 버튼 크기 강화
         btn_search = tk.Button(
             filter_frame, text="🔍 조회하기", bg="#3B82F6", fg="white", font=("맑은 고딕", 11, "bold"),
-            bd=0, activebackground="#2563EB", cursor="hand2", padx=px(12), height=1
+            bd=0, activebackground="#2563EB", activeforeground="white", cursor="hand2", padx=px(12), height=1,
+            command=self.load_logs_filtered
         )
-        btn_search.grid(row=0, column=6, padx=px(10), pady=5)
-        btn_search.config(command=self.load_logs_filtered)
+        btn_search.grid(row=2, column=2, padx=px(10), pady=5, sticky=tk.E)
 
-        # 로그 트리뷰 목록
+        # 로그 트리뷰 목록 (조회 유형에 따라 내역/학생별 합계 컬럼으로 바뀐다)
         list_container = tk.Frame(self.tab_logs)
-        list_container.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
+        list_container.pack(fill=tk.BOTH, expand=True, padx=5, pady=(5, 0))
 
         scroll = ttk.Scrollbar(list_container)
         scroll.pack(side=tk.RIGHT, fill=tk.Y)
 
-        self.tree_logs = ttk.Treeview(
-            list_container, columns=("user_id", "name", "log_type", "log_date", "log_time"), show="headings",
-            yscrollcommand=scroll.set
-        )
-        self.tree_logs.heading("user_id", text="학번")
-        self.tree_logs.heading("name", text="이름")
-        self.tree_logs.heading("log_type", text="구분")
-        self.tree_logs.heading("log_date", text="날짜")
-        self.tree_logs.heading("log_time", text="시간")
-        
-        self.tree_logs.column("user_id", width=px(100), anchor=tk.CENTER)
-        self.tree_logs.column("name", width=px(80), anchor=tk.CENTER)
-        self.tree_logs.column("log_type", width=px(70), anchor=tk.CENTER)
-        self.tree_logs.column("log_date", width=px(110), anchor=tk.CENTER)
-        self.tree_logs.column("log_time", width=px(110), anchor=tk.CENTER)
+        self.tree_logs = ttk.Treeview(list_container, show="headings", yscrollcommand=scroll.set)
+        self.tree_logs.tag_configure("invalid", foreground="#94A3B8")
         self.tree_logs.pack(fill=tk.BOTH, expand=True)
         scroll.config(command=self.tree_logs.yview)
 
-        self.load_logs()
+        self.lbl_log_result = tk.Label(self.tab_logs, text="", anchor=tk.W, bg="#F8FAFC", fg="#334155",
+                                       font=("맑은 고딕", 10, "bold"), padx=px(10), pady=px(6))
+        self.lbl_log_result.pack(fill=tk.X, padx=5, pady=(0, 5))
+
+        self.on_log_mode_changed()
+
+    def current_log_mode(self):
+        return LOG_FILTER_MODES[self.cmb_log_mode.current()][0]
+
+    def on_log_mode_changed(self):
+        mode = self.current_log_mode()
+
+        # 오늘/최근 7일은 날짜를 고를 필요가 없고, 월/주 단위는 기준일 1개, 직접 선택은 시작~종료 2개
+        if mode in ("today", "recent7", "recent7_sum"):
+            self.lbl_log_date.config(text="기간:")
+            self.date_start.grid_remove()
+            self.lbl_date_tilde.grid_remove()
+            self.date_end.grid_remove()
+        elif mode == "custom":
+            self.lbl_log_date.config(text="기간:")
+            self.date_start.grid()
+            self.lbl_date_tilde.grid()
+            self.date_end.grid()
+        else:
+            self.lbl_log_date.config(text="기준일:")
+            self.date_start.grid()
+            self.lbl_date_tilde.grid_remove()
+            self.date_end.grid_remove()
+
+        self.load_logs_filtered()
+
+    def get_log_period(self):
+        """현재 조회 유형의 실제 조회 기간 (시작일, 종료일)."""
+        mode = self.current_log_mode()
+        today = date.today()
+        if mode == "today":
+            return today, today
+        if mode in ("recent7", "recent7_sum"):
+            return today - timedelta(days=6), today
+
+        anchor = self.date_start.get_date()
+        if mode == "month":
+            last_day = calendar.monthrange(anchor.year, anchor.month)[1]
+            return anchor.replace(day=1), anchor.replace(day=last_day)
+        if mode in ("week_days", "week_hours"):
+            monday = anchor - timedelta(days=anchor.weekday())
+            return monday, monday + timedelta(days=6)
+
+        start, end = self.date_start.get_date(), self.date_end.get_date()
+        if start > end:  # 거꾸로 골랐으면 순서를 바로잡아 보여준다
+            self.date_start.set_date(end)
+            self.date_end.set_date(start)
+            start, end = end, start
+        return start, end
 
     # DB 및 로드 제어 기능들
     def load_students(self):
@@ -1036,41 +1268,110 @@ class AdminDashboardFrame(tk.Frame):
         self.load_logs_filtered()
 
     def load_logs_filtered(self):
-        for item in self.tree_logs.get_children():
-            self.tree_logs.delete(item)
+        mode = self.current_log_mode()
+        start, end = self.get_log_period()
+        keyword = self.ent_search_name.get().strip()
 
-        start_date = self.ent_start_date.get().strip()
-        end_date = self.ent_end_date.get().strip()
-        search_name = self.ent_search_name.get().strip()
+        if mode == "today":
+            range_text = format_date_ko(start)
+        elif mode == "month":
+            range_text = f"→ {start.year}년 {start.month}월 전체"
+        elif mode == "custom":
+            range_text = ""
+        else:
+            range_text = f"{'→ ' if mode in ('week_days', 'week_hours') else ''}{format_date_ko(start)} ~ {format_date_ko(end)}"
+        self.lbl_log_range.config(text=range_text)
 
-        # 값이 누락되었을 시 기본값 보강
-        if not start_date: start_date = "1970-01-01"
-        if not end_date: end_date = "2999-12-31"
+        if mode in LOG_SUMMARY_MODES:
+            self._show_log_summary(mode, start, end, keyword)
+        else:
+            self._show_log_rows(start, end, keyword)
+
+    def _set_log_columns(self, columns):
+        """columns: (키, 제목, 폭, 정렬) 목록으로 트리뷰 컬럼을 바꾸고 기존 행을 비운다."""
+        self.tree_logs.delete(*self.tree_logs.get_children())
+        self.tree_logs["columns"] = [key for key, _, _, _ in columns]
+        self.tree_logs["displaycolumns"] = "#all"
+        for key, heading, width, anchor in columns:
+            self.tree_logs.heading(key, text=heading)
+            self.tree_logs.column(key, width=px(width), anchor=anchor)
+
+    def _show_log_rows(self, start, end, keyword):
+        self._set_log_columns([
+            ("user_id", "학번", 100, tk.CENTER),
+            ("name", "이름", 80, tk.CENTER),
+            ("log_type", "구분", 95, tk.CENTER),
+            ("log_date", "날짜", 125, tk.CENTER),
+            ("log_time", "시간", 85, tk.CENTER),
+        ])
+
+        query = """
+            SELECT user_id, name, log_type, log_date, log_time
+            FROM attendance_logs
+            WHERE log_date BETWEEN ? AND ?
+        """
+        params = [start.isoformat(), end.isoformat()]
+        if keyword:
+            query += " AND (name LIKE ? OR user_id LIKE ?)"
+            params += [f"%{keyword}%", f"%{keyword}%"]
+        query += " ORDER BY log_date DESC, log_time DESC"
 
         conn = sqlite3.connect(DB_PATH)
         cursor = conn.cursor()
-
-        if search_name:
-            query = """
-                SELECT user_id, name, log_type, log_date, log_time 
-                FROM attendance_logs 
-                WHERE name LIKE ? AND log_date BETWEEN ? AND ? 
-                ORDER BY id DESC
-            """
-            cursor.execute(query, (f"%{search_name}%", start_date, end_date))
-        else:
-            query = """
-                SELECT user_id, name, log_type, log_date, log_time 
-                FROM attendance_logs 
-                WHERE log_date BETWEEN ? AND ? 
-                ORDER BY id DESC
-            """
-            cursor.execute(query, (start_date, end_date))
-
-        for r in cursor.fetchall():
-            display_type = "출근" if r[2] == 'CHECK_IN' else "퇴근"
-            self.tree_logs.insert("", tk.END, values=(r[0], r[1], display_type, r[3], r[4]))
+        cursor.execute(query, params)
+        rows = cursor.fetchall()
         conn.close()
+
+        for user_id, name, log_type, log_date, log_time in rows:
+            valid = is_valid_attendance_time(log_time)
+            type_text = "출근" if log_type == "CHECK_IN" else "퇴근"
+            if not valid:
+                type_text += " (미인정)"  # 00:00~06:00 기록은 일수/시간 계산에서 빠진다
+            try:
+                date_text = format_date_ko(datetime.strptime(log_date, "%Y-%m-%d").date())
+            except (TypeError, ValueError):
+                date_text = log_date
+            self.tree_logs.insert("", tk.END, values=(user_id, name, type_text, date_text, log_time),
+                                  tags=() if valid else ("invalid",))
+
+        check_in = sum(1 for r in rows if r[2] == "CHECK_IN")
+        self.lbl_log_result.config(
+            text=f"총 {len(rows)}건 (출근 {check_in} · 퇴근 {len(rows) - check_in}) · 학생 {len({r[0] for r in rows})}명"
+        )
+
+    def _show_log_summary(self, mode, start, end, keyword):
+        self._set_log_columns([
+            ("user_id", "학번", 110, tk.CENTER),
+            ("name", "이름", 90, tk.CENTER),
+            ("days", "출근 일수", 90, tk.CENTER),
+            ("seconds", "출석 시간 합계", 170, tk.CENTER),
+        ])
+
+        summary = get_attendance_summary_by_student(start.isoformat(), end.isoformat())
+        if keyword:
+            summary = [s for s in summary if keyword in s["name"] or keyword in s["user_id"]]
+
+        # 기준은 학생 화면의 주간 현황과 같다: 인정 출근 일수 ≥ 3일, 인정 시간 ≥ 20시간 (월~일)
+        if mode == "week_days":
+            summary = [s for s in summary if s["days"] >= WEEKLY_REQUIRED_DAYS]
+            summary.sort(key=lambda s: (-s["days"], -s["seconds"], s["name"]))
+        elif mode == "week_hours":
+            summary = [s for s in summary if s["seconds"] >= WEEKLY_REQUIRED_SECONDS]
+            summary.sort(key=lambda s: (-s["seconds"], -s["days"], s["name"]))
+        else:
+            summary.sort(key=lambda s: (-s["seconds"], -s["days"], s["name"]))
+
+        for s in summary:
+            self.tree_logs.insert("", tk.END, values=(s["user_id"], s["name"], f"{s['days']}일",
+                                                      format_duration(s["seconds"])))
+
+        if mode == "recent7_sum":
+            total = sum(s["seconds"] for s in summary)
+            attended = sum(1 for s in summary if s["days"] > 0)
+            text = f"학생 {len(summary)}명 중 출석 {attended}명 · 전체 출석 시간 {format_duration(total)}"
+        else:
+            text = f"조건을 충족한 학생 {len(summary)}명"
+        self.lbl_log_result.config(text=text)
 
     def on_student_select(self, event):
         selected = self.tree_students.selection()

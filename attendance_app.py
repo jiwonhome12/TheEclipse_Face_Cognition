@@ -1462,6 +1462,26 @@ class AdminDashboardFrame(tk.Frame):
             self.load_logs()
             self.parent.reload_users()
 
+    def _find_duplicate_face(self, embedding):
+        """새로 등록하려는 얼굴 임베딩이 기존 등록자와 동일 인물로 보이는지 확인한다.
+        인식 화면에서 쓰는 것과 같은 코사인 유사도 THRESHOLD를 기준으로 삼는다."""
+        enrolled_users = self.parent.enrolled_users
+        embed_matrix = self.parent.embed_matrix
+        if not enrolled_users or embed_matrix is None or len(embed_matrix) == 0:
+            return None
+
+        norm = np.linalg.norm(embedding)
+        if norm == 0:
+            return None
+        normed = embedding / norm
+
+        sims = embed_matrix @ normed
+        best_idx = int(np.argmax(sims))
+        best_sim = float(sims[best_idx])
+        if best_sim >= THRESHOLD:
+            return enrolled_users[best_idx]
+        return None
+
     def register_student(self):
         s_id = self.add_id.get().strip()
         pwd = self.add_pwd.get().strip()
@@ -1484,7 +1504,19 @@ class AdminDashboardFrame(tk.Frame):
             conn.close()
             return
 
-        emb = self.parent.cached_faces[0].embedding.tobytes()
+        new_embedding = self.parent.cached_faces[0].embedding.astype(np.float32)
+        dup_user = self._find_duplicate_face(new_embedding)
+        if dup_user:
+            messagebox.showerror(
+                "중복 얼굴 감지",
+                f"이미 등록된 얼굴과 유사도가 높습니다.\n"
+                f"기존 등록자: {dup_user['name']} ({dup_user['user_id']})\n"
+                "동일 인물로 판단되어 등록을 진행하지 않습니다."
+            )
+            conn.close()
+            return
+
+        emb = new_embedding.tobytes()
         cursor.execute("""
             INSERT INTO users (user_id, password, name, major, role, embedding, penalty)
             VALUES (?, ?, ?, ?, ?, ?, 0)

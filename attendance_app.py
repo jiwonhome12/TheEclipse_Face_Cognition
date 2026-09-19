@@ -417,6 +417,51 @@ def get_weekly_attendance_stats(user_id):
         "missing_seconds": max(0, WEEKLY_REQUIRED_SECONDS - total_seconds),
     }
 
+def get_today_attendance_status(user_id):
+    """
+    오늘 출석 상태를 구한다.
+    - finished_seconds : 오늘 퇴근까지 찍어서 인정된 시간(초)
+    - working_since    : 지금 출근 중이면 그 출근 시각("HH:MM:SS"), 아니면 None
+    - working_seconds  : 지금 출근 중인 시간(초). 출근 중이 아니면 0
+    00:00~06:00 사이 기록은 인정되지 않으므로 계산에서 뺀다.
+    """
+    now = datetime.now()
+    today_str = now.strftime("%Y-%m-%d")
+
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    cursor.execute("""
+        SELECT user_id, name, log_date, log_type, log_time
+        FROM attendance_logs
+        WHERE user_id = ? AND log_date = ?
+        ORDER BY log_time ASC
+    """, (user_id, today_str))
+    logs = [log for log in cursor.fetchall() if is_valid_attendance_time(log[4])]
+    conn.close()
+
+    sessions = pair_attendance_sessions(logs)
+    finished_seconds = int(sum(session_seconds(s) for s in sessions))
+
+    # 출근만 찍고 퇴근을 안 찍은 기록이 있으면 지금 출근 중인 것으로 본다
+    working_since = None
+    for session in sessions:
+        if session["check_in"] and not session["check_out"]:
+            working_since = session["check_in"]
+
+    working_seconds = 0
+    if working_since:
+        try:
+            started = datetime.strptime(f"{today_str} {working_since}", "%Y-%m-%d %H:%M:%S")
+            working_seconds = int(max(0, (now - started).total_seconds()))
+        except ValueError:
+            working_since = None
+
+    return {
+        "finished_seconds": finished_seconds,
+        "working_since": working_since,
+        "working_seconds": working_seconds,
+    }
+
 def log_attendance(user_id, name, log_type):
     today_date = datetime.now().strftime("%Y-%m-%d")
     now_time = datetime.now().strftime("%H:%M:%S")
@@ -708,6 +753,18 @@ class StudentInfoFrame(tk.Frame):
             format_duration(weekly["missing_seconds"]) if weekly["missing_seconds"] else "",
         )
 
+        # 오늘 출근 현황 — 출근 중이면 1초마다 경과 시간을 갱신한다
+        tk.Label(stats_grid, text="• 오늘 출근 :", font=("맑은 고딕", 11), bg="#F8FAFC", fg="#334155") \
+            .grid(row=4, column=0, sticky=tk.W, pady=px(2))
+        self.lbl_today_value = tk.Label(stats_grid, text="", font=("맑은 고딕", 11, "bold"), bg="#F8FAFC", fg="#0F172A")
+        self.lbl_today_value.grid(row=4, column=1, sticky=tk.W, padx=(px(8), 0), pady=px(2))
+        self.lbl_today_note = tk.Label(stats_grid, text="", font=("맑은 고딕", 10, "bold"), bg="#F8FAFC", fg="#94A3B8")
+        self.lbl_today_note.grid(row=5, column=1, sticky=tk.W, padx=(px(8), 0), pady=(0, px(4)))
+
+        self._today_after_id = None
+        self.bind("<Destroy>", self._stop_today_timer)
+        self._refresh_today_status()
+
         # 3진 아웃제 기준 패널티 색상 경고 표기
         penalty_val = student_info['penalty']
         penalty_color = "#EF4444" if penalty_val >= 2 else "#F59E0B" if penalty_val == 1 else "#10B981"
@@ -766,6 +823,33 @@ class StudentInfoFrame(tk.Frame):
             command=lambda: self.handle_action("CHECK_OUT")
         )
         btn_out.pack(side=tk.RIGHT, expand=True, fill=tk.X, padx=5)
+
+    def _refresh_today_status(self):
+        """오늘 출근 시간을 다시 계산해서 표시한다. 출근 중이면 1초 뒤에 다시 갱신한다."""
+        if not self.winfo_exists():
+            return
+
+        status = get_today_attendance_status(self.student_info["user_id"])
+        total_seconds = status["finished_seconds"] + status["working_seconds"]
+        self.lbl_today_value.config(text=format_duration(total_seconds))
+
+        if status["working_since"]:
+            self.lbl_today_note.config(
+                text=f"출근 중 · {status['working_since']} 출근 (퇴근을 찍어야 시간 인정)", fg="#10B981"
+            )
+            self._today_after_id = self.after(1000, self._refresh_today_status)
+        elif total_seconds > 0:
+            self.lbl_today_note.config(text="퇴근 상태", fg="#94A3B8")
+        else:
+            self.lbl_today_note.config(text="오늘 출근 기록 없음", fg="#94A3B8")
+
+    def _stop_today_timer(self, event=None):
+        """카드가 사라지면(다른 화면으로 전환되면) 갱신 예약을 취소한다."""
+        if event is not None and event.widget is not self:
+            return
+        if self._today_after_id is not None:
+            self.after_cancel(self._today_after_id)
+            self._today_after_id = None
 
     def handle_action(self, log_type):
         # 도용 방지 비밀번호 확인 다이얼로그 띄우기

@@ -13,8 +13,22 @@ from tkinter import ttk, messagebox, simpledialog, filedialog
 from tkinter import font as tkfont
 from PIL import Image, ImageDraw, ImageFont, ImageTk
 
-DB_PATH = "faces.db"
+# 프로그램 파일이 있는 폴더 — 어느 폴더에서 실행해도 같은 DB/모델을 쓰도록 기준으로 삼는다
+APP_DIR = os.path.dirname(os.path.abspath(__file__))
+
+DB_PATH = os.path.join(APP_DIR, "faces.db")
 THRESHOLD = 0.50
+
+# 사진/화면 영상으로 대리 출석하는 것을 막기 위한 눈 깜빡임 검사 (MediaPipe FaceLandmarker)
+# 모델 파일이 없으면 검사는 자동으로 꺼지고, 출퇴근은 예전처럼 그대로 동작한다.
+LIVENESS_MODEL_PATH = os.path.join(APP_DIR, "face_landmarker.task")
+LIVENESS_MODEL_URL = (
+    "https://storage.googleapis.com/mediapipe-models/face_landmarker/"
+    "face_landmarker/float16/1/face_landmarker.task"
+)
+BLINK_CLOSED_SCORE = 0.5    # 이 값을 넘으면 눈을 감은 것으로 본다
+BLINK_OPEN_SCORE = 0.3      # 다시 이 아래로 내려오면 한 번 깜빡인 것으로 센다
+BLINK_VALID_SECONDS = 10    # 출퇴근을 누르기 전 이 시간 안에 깜빡임이 있어야 한다
 RIGHT_PANEL_WIDTH = 620  # 우측 UI 패널 폭 — 1600x900 기준 값이고, 실제로는 px()로 화면 배율을 곱해서 쓴다
 
 # 기준 창 크기(창공시스템과 동일). 모니터가 이보다 작으면 UI_SCALE만큼 전체를 줄여서 띄운다.
@@ -45,6 +59,72 @@ class DetectedFace:
         self.embedding = embedding
 
 
+def download_liveness_model():
+    """
+    깜빡임 검사용 모델(face_landmarker.task, 약 3.7MB)을 내려받는다.
+    인터넷이 없거나 실패하면 False를 돌려주고, 이때는 깜빡임 검사 없이 프로그램이 그대로 동작한다.
+    """
+    import urllib.request
+
+    temp_path = LIVENESS_MODEL_PATH + ".part"
+    try:
+        print("[출석] 깜빡임 검사 모델을 내려받는 중입니다... (최초 1회)")
+        urllib.request.urlretrieve(LIVENESS_MODEL_URL, temp_path)
+        os.replace(temp_path, LIVENESS_MODEL_PATH)
+        print("[출석] 깜빡임 검사 모델 준비 완료")
+        return True
+    except Exception as e:
+        print(f"[출석] 깜빡임 검사 모델을 받지 못했습니다 ({e}). 깜빡임 검사 없이 실행합니다.")
+        try:
+            os.remove(temp_path)
+        except OSError:
+            pass
+        return False
+
+
+def create_blink_detector():
+    """
+    MediaPipe FaceLandmarker를 준비한다. 눈 깜빡임 정도(blendshape)를 읽어
+    사진/화면으로 얼굴을 들이대는 것을 걸러내는 데 쓴다.
+    모델 파일이 없거나 MediaPipe를 못 불러오면 None을 돌려주고, 이 경우 깜빡임 검사는 꺼진다.
+    """
+    if not os.path.exists(LIVENESS_MODEL_PATH):
+        # 다른 PC에서 처음 실행할 때 모델 파일이 없으면 한 번 내려받는다 (실패하면 검사만 꺼진다)
+        if not download_liveness_model():
+            return None
+    try:
+        from mediapipe.tasks.python import BaseOptions
+        from mediapipe.tasks.python import vision
+        return vision.FaceLandmarker.create_from_options(vision.FaceLandmarkerOptions(
+            base_options=BaseOptions(model_asset_path=LIVENESS_MODEL_PATH),
+            running_mode=vision.RunningMode.VIDEO,
+            output_face_blendshapes=True,   # eyeBlinkLeft / eyeBlinkRight 값을 쓰기 위해
+            num_faces=1,
+        ))
+    except Exception:
+        return None
+
+
+def detect_blink_score(landmarker, frame, timestamp_ms):
+    """
+    프레임에서 눈이 감긴 정도(0~1)를 구한다. 양쪽 눈 중 더 크게 감긴 쪽 값을 쓴다.
+    얼굴을 못 찾았거나 검사가 꺼져 있으면 None.
+    """
+    if landmarker is None:
+        return None
+    try:
+        import mediapipe as mp
+        image = mp.Image(image_format=mp.ImageFormat.SRGB, data=cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
+        result = landmarker.detect_for_video(image, timestamp_ms)
+    except Exception:
+        return None
+
+    if not result.face_blendshapes:
+        return None
+    scores = {b.category_name: b.score for b in result.face_blendshapes[0]}
+    return max(scores.get("eyeBlinkLeft", 0.0), scores.get("eyeBlinkRight", 0.0))
+
+
 def face_inference_process(conn, threads):
     import onnxruntime
     from insightface.app import FaceAnalysis
@@ -66,11 +146,16 @@ def face_inference_process(conn, threads):
             model.session.model_path, sess_options=opts, providers=["CPUExecutionProvider"]
         )
 
+    # 사진/영상 판별용 깜빡임 검출기 (모델 파일이 없으면 None)
+    blink_landmarker = create_blink_detector()
+
     conn.send("ready")
     while True:
         frame = conn.recv()
         faces = app.get(frame)
-        conn.send([(f.bbox, f.embedding) for f in faces])
+        # MediaPipe VIDEO 모드는 타임스탬프가 계속 커져야 한다
+        blink_score = detect_blink_score(blink_landmarker, frame, int(time.perf_counter() * 1000))
+        conn.send(([(f.bbox, f.embedding) for f in faces], blink_score))
 
 
 def px(value):
@@ -852,6 +937,15 @@ class StudentInfoFrame(tk.Frame):
             self._today_after_id = None
 
     def handle_action(self, log_type):
+        # 사진/화면으로 얼굴을 들이대는 것 차단 — 최근에 눈을 깜빡인 적이 있어야 한다
+        if not self.parent.has_recent_blink():
+            messagebox.showerror(
+                "본인 확인 실패",
+                "사람 얼굴이 아닌 것으로 보입니다.\n"
+                "카메라를 바라보고 눈을 한 번 깜빡인 뒤 다시 눌러주세요.",
+            )
+            return
+
         # 도용 방지 비밀번호 확인 다이얼로그 띄우기
         pwd_input = simpledialog.askstring("도용 방지", "본인 확인을 위해 비밀번호를 입력해주세요:", show="*", parent=self)
         if pwd_input is None:
@@ -1580,6 +1674,15 @@ class AdminDashboardFrame(tk.Frame):
             messagebox.showerror("얼굴 인식 실패", "카메라 영역에 등록할 학생의 얼굴이 감지되지 않았습니다.")
             return
 
+        # 사진으로 학생이 등록되면 이후 출석도 사진으로 뚫리므로 등록할 때도 깜빡임을 확인한다
+        if not self.parent.has_recent_blink():
+            messagebox.showerror(
+                "얼굴 인식 실패",
+                "사람 얼굴이 아닌 것으로 보입니다.\n"
+                "등록할 학생이 카메라를 바라보고 눈을 한 번 깜빡인 뒤 다시 눌러주세요.",
+            )
+            return
+
         conn = sqlite3.connect(DB_PATH)
         cursor = conn.cursor()
         cursor.execute("SELECT id FROM users WHERE user_id = ?", (s_id,))
@@ -1707,6 +1810,11 @@ class AttendanceApp:
         self.admin_login_requested = False  # 학생 화면에서 [관리자]를 눌러 로그인 화면으로 넘어온 상태
         self.camera_on = True
 
+        # 사진/영상 판별용 깜빡임 상태 (인식 프로세스가 깜빡임 값을 보내주면 켜진다)
+        self.liveness_enabled = False
+        self.last_blink_time = 0.0
+        self._eye_closed = False
+
         # UI 레이아웃 구성
         self.create_widgets()
 
@@ -1782,6 +1890,11 @@ class AttendanceApp:
                                        font=("맑은 고딕", 11, "bold"))
         self.lbl_cam_status.pack(side=tk.LEFT, padx=px(16))
 
+        # 깜빡임(사람 확인) 상태 — 사진을 들이대면 여기가 회색으로 남는다
+        self.lbl_liveness = tk.Label(cam_bar, text="", bg="#1E293B", fg="#94A3B8",
+                                     font=("맑은 고딕", 10, "bold"))
+        self.lbl_liveness.pack(side=tk.LEFT)
+
         self.btn_camera_toggle = tk.Button(
             cam_bar, text="📷 화면 끄기", bg="#334155", fg="white", bd=0,
             activebackground="#475569", activeforeground="white",
@@ -1827,13 +1940,36 @@ class AttendanceApp:
                 if self.camera_on and frame is not None and seq != last_seq:
                     last_seq = seq
                     self.face_conn.send(frame)
-                    results = self.face_conn.recv()
+                    results, blink_score = self.face_conn.recv()
                     if self.camera_on:  # 분석 중에 화면을 껐다면 예전 얼굴을 남기지 않는다
                         self.cached_faces = [DetectedFace(bbox, emb) for bbox, emb in results]
+                        self._update_blink_state(blink_score)
                 else:
                     time.sleep(0.005)
         except (EOFError, OSError):
             pass  # 프로그램 종료로 인식 프로세스가 닫힌 경우
+
+    def _update_blink_state(self, blink_score):
+        """
+        눈을 감았다가(BLINK_CLOSED_SCORE 이상) 다시 떴을 때(BLINK_OPEN_SCORE 이하)
+        한 번 깜빡인 것으로 보고 시각을 기록한다.
+        사진은 눈을 감지 못하므로 이 시각이 갱신되지 않는다.
+        """
+        if blink_score is None:
+            return  # 얼굴을 못 찾았거나 깜빡임 검사가 꺼져 있음
+
+        self.liveness_enabled = True
+        if blink_score >= BLINK_CLOSED_SCORE:
+            self._eye_closed = True
+        elif self._eye_closed and blink_score <= BLINK_OPEN_SCORE:
+            self._eye_closed = False
+            self.last_blink_time = time.time()
+
+    def has_recent_blink(self):
+        """최근 BLINK_VALID_SECONDS 안에 눈을 깜빡였는지. 검사가 꺼져 있으면 항상 통과."""
+        if not self.liveness_enabled:
+            return True
+        return (time.time() - self.last_blink_time) <= BLINK_VALID_SECONDS
 
     def update_video(self):
         frame = self.latest_frame
@@ -1944,6 +2080,16 @@ class AttendanceApp:
             self.lbl_cam_status.config(text=f"● LIVE  {self._fps_count / elapsed:.0f} fps", fg="#10B981")
             self._fps_count = 0
             self._fps_since = now
+            self._update_liveness_label()
+
+    def _update_liveness_label(self):
+        """깜빡임이 확인된 상태인지 카메라 상태바에 표시한다."""
+        if not self.liveness_enabled:
+            self.lbl_liveness.config(text="")
+        elif self.has_recent_blink():
+            self.lbl_liveness.config(text="👁 사람 확인됨", fg="#10B981")
+        else:
+            self.lbl_liveness.config(text="👁 눈을 깜빡여 주세요", fg="#94A3B8")
 
     def toggle_camera(self):
         """카메라 화면 표시를 켜고 끈다. 꺼져 있는 동안은 얼굴 인식도 같이 멈춘다."""

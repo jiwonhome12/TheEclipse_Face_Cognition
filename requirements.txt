@@ -2,3 +2,14 @@ Cython>=0.29.28
 cmake>=3.22.3
 numpy>=1.22.3
 openpyxl>=3.1.0
+
+# 출석체크 프로그램(attendance_app.py) 실행에 필요한 패키지
+opencv-python>=4.8.0
+pillow>=10.0.0
+insightface>=2.0        # 2.0부터 공식 위조판별(liveness) 애드온 지원
+onnxruntime>=1.16.0
+# 사진/영상 판별용 눈 깜빡임 검사에 사용 (mediapipe.tasks FaceLandmarker)
+# 모델 파일 face_landmarker.task 가 프로젝트 폴더에 같이 있어야 한다.
+# 없으면 아래 주소에서 받는다:
+# https://storage.googleapis.com/mediapipe-models/face_landmarker/face_landmarker/float16/1/face_landmarker.task
+mediapipe>=0.10.0

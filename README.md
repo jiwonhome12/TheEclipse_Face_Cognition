@@ -1,311 +1,140 @@
+# 창의공간 얼굴인식 출석체크 시스템
 
-# InsightFace: 2D and 3D Face Analysis Project
+동서대학교 창의공간(The Eclipse)의 출입 학생 출결을 **얼굴인식으로 자동 기록**하는 데스크톱 프로그램입니다.
+학생이 카메라 앞에 서면 본인 정보가 뜨고, [출근] / [퇴근] 버튼으로 출결이 기록됩니다.
+기록은 창공시스템(SeatManagerApp)으로 자동 전달되고, 관리자는 주간 출석 시간·일수를 바로 확인할 수 있습니다.
 
-<div align="left">
-  <img src="https://raw.githubusercontent.com/nttstar/insightface-resources/refs/heads/master/images/insightface_logo.jpg_320x320.webp" width="240"/>
-</div>
+---
 
-InsightFace project is mainly maintained by [Jia Guo](mailto:guojia@insightface.ai) and [Jiankang Deng](https://jiankangdeng.github.io/). 
+## 1. 왜 만들었나
 
-For more information, please visit our website at [https://insightface.ai](https://insightface.ai)
+창의공간은 학생이 주 단위로 정해진 시간을 채워야 하는 공간입니다. 기존 방식에는 다음 문제가 있었습니다.
 
-## InsightFace 1.0 Update
+| 문제 | 이 프로그램의 해결 |
+| --- | --- |
+| 수기 명부·엑셀 정리에 시간이 오래 걸림 | 얼굴인식으로 자동 기록, 엑셀 추출 버튼 제공 |
+| 대리 출석(친구가 대신 체크) | 얼굴인식 + 본인 비밀번호 + 눈 깜빡임 확인 |
+| 사진을 들이대는 방식의 부정 출석 | MediaPipe 깜빡임 검사로 차단 |
+| 학생이 자기 이수 시간을 알기 어려움 | 이번주 일수·시간·부족분을 화면에서 바로 확인 |
+| 창공시스템과 출결 데이터가 따로 놈 | 파일 연동으로 명단·출결 자동 동기화 |
 
-InsightFace 1.0 focuses on easier local evaluation and desktop usage:
+## 2. 무엇을 연동했나
 
-- The default Python package no longer builds the optional C++/Cython `face3d` extension, reducing local compiler requirements.
-- Added **InsightFace Evaluation Studio**, a cross-platform GUI Demo for Windows, macOS, and Linux.
-- The GUI supports local face recognition, enterprise model evaluation/reporting, and basic face swap trials.
+| 기술 | 쓰는 곳 |
+| --- | --- |
+| **InsightFace** (buffalo_l, ONNX Runtime) | 얼굴 검출 + 512차원 임베딩 추출, 코사인 유사도 0.50 이상이면 본인으로 판정 |
+| **InsightFace liveness 애드온** (2.0 이상) | 사진·화면 위조 판별. 얼굴마다 실제 사람 점수(0~1)를 매겨 0.8 미만이면 차단 |
+| **Google MediaPipe** (`mediapipe.tasks` FaceLandmarker) | 눈 깜빡임(blendshape) 검사 — 위조판별 애드온을 못 쓰는 환경의 2차 방어 |
+| **OpenCV** | 웹캠 캡처(DirectShow, 640x480 30fps) |
+| **Tkinter** | 화면 구성. 모니터 크기에 맞춰 UI 배율 자동 조절 |
+| **SQLite** (`faces.db`) | 학생 정보, 얼굴 임베딩, 출결 로그 저장 |
+| **창공시스템(SeatManagerApp, C#)** | `roster.json`(명단) 읽기 / `attendance.json`(출결) 쓰기 |
+| **openpyxl** | 출결 엑셀(.xlsx) 추출 |
 
-## InsightFace Server
+### 창공시스템 연동 방식
 
-The new [InsightFace Server](server/) provides a simple self-hosted Web UI,
-snake_case REST API, and Python client for detection, comparison,
-registration, and Person search. A single Linux x86_64 CPU or NVIDIA GPU
-container runs local ONNX Runtime inference and SQLite with operator-supplied,
-manifest-verified models. It is a simple AWS Rekognition alternative with 
-accuracy-preserving INT8 embedding quantization and 50M+ image search on one RTX 5090 GPU.
-
-## License
-
-The code of InsightFace is released under the MIT License. There is no limitation for both academic and commercial usage.
-
-The training data containing the annotation (and the models trained with these data) are available for non-commercial research purposes only.
-
-Both manual-downloading models from our github repo and auto-downloading models with our [python-library](python-package) follow the above license policy(which is for non-commercial research purposes only).
-
-`2025-11-24 Update:`
-
-1. For inswapper series face swap models (e.g., inswapper_128.onnx/[inswapper-512-live](https://github.com/deepinsight/inswapper-512-live)), please contact [contact@insightface.ai](mailto:contact@insightface.ai) for licensing and additional support.
-2. For open-sourced face recognition models (e.g., buffalo_l package), please contact [recognition-oss-pack@insightface.ai](mailto:recognition-oss-pack@insightface.ai) for licensing.
-3. For advanced face recognition SDK and models (e.g., InspireFace SDK), please contact [contact@insightface.ai](mailto:contact@insightface.ai) for licensing and additional support.
-
-
-## Top News
-
-**`2026-07-27`** [InsightFace Server](server/) Added a simple AWS Rekognition alternative with accuracy-preserving INT8 embedding quantization and 50M+ image search on one RTX 5090 GPU.
-
-**`2026-05-23`** `InsightFace 1.0` Added a cross-platform desktop GUI Demo for face recognition, enterprise evaluation, reports, and face swap trials, with a lighter default Python install that removes C++ build requirements.
-
-**`2025-11-18`** `[Picsi.ai]` Released Live Face Swap macOS & iOS App and updated [Picsi.ai](https://www.picsi.ai) services with our latest series of swap models (incl. [inswapper-512-live](https://github.com/deepinsight/inswapper-512-live)/Cyn/Dax).
-
-**`2024-05-04`** `[Picsi.ai]` Released [InspireFace](cpp-package/inspireface), a cross-platform C/C++ face recognition SDK.
-
-**`2022-08-12`**: We achieved Rank-1st of 
-[Perspective Projection Based Monocular 3D Face Reconstruction Challenge](https://tianchi.aliyun.com/competition/entrance/531961/introduction)
-of [ECCV-2022 WCPA Workshop](https://sites.google.com/view/wcpa2022), [paper](https://arxiv.org/abs/2208.07142) and [code](reconstruction/jmlr).
-
-**`2021-10-29`**: We achieved 1st place on the [VISA track](https://pages.nist.gov/frvt/plots/11/visa.html) of [NIST-FRVT 1:1](https://pages.nist.gov/frvt/html/frvt11.html) by using Partial FC (Xiang An, Jiankang Deng, Jia Guo).
-
-## ChangeLogs
-
-**`2026-07-27`** [InsightFace Server](server/) Added a simple AWS Rekognition alternative with accuracy-preserving INT8 embedding quantization and 50M+ image search on one RTX 5090 GPU.
-
-**`2025-11-18`** `[Picsi.ai]` Released Live Face Swap macOS & iOS App and updated [Picsi.ai](https://www.picsi.ai) services with our latest series of swap models (incl. [inswapper-live](https://github.com/deepinsight/inswapper-512-live)/Cyn/Dax).
-
-**`2024-05-04`** `[Picsi.ai]` Released [InspireFace](cpp-package/inspireface), a cross-platform C/C++ face recognition SDK.
-
-**`2024-04-17`**: [Monocular Identity-Conditioned Facial Reflectance Reconstruction](https://arxiv.org/abs/2404.00301) accepted by [CVPR-2024](https://cvpr.thecvf.com/Conferences/2024).
-
-**`2023-08-08`**: We released the implementation of [Generalizing Gaze Estimation with Weak-Supervision from Synthetic Views](https://arxiv.org/abs/2212.02997) at [reconstruction/gaze](reconstruction/gaze).
-
-**`2023-05-03`**: We have launched the ongoing version of wild face anti-spoofing challenge. See details [here](https://github.com/deepinsight/insightface/tree/master/challenges/cvpr23-fas-wild#updates).
-
-**`2023-02-13`**: We launch a large scale in the wild face anti-spoofing challenge on CVPR23 Workshop, see details at [challenges/cvpr23-fas-wild](challenges/cvpr23-fas-wild).
-
-**`2022-11-28`**: Single line code for facial identity swapping in our python packge ver 0.7, please check the example [here](examples/in_swapper).
-
-**`2022-10-28`**: [MFR-Ongoing](http://iccv21-mfr.com) website is refactored, please create issues if there's any bug.
-
-**`2022-09-22`**: Now we have [web-demos](web-demos): [face-localization](http://demo.insightface.ai:7007/), [face-recognition](http://demo.insightface.ai:7008/), and [face-swapping](http://demo.insightface.ai:7009/).
-
-**`2022-08-12`**: We achieved Rank-1st of 
-[Perspective Projection Based Monocular 3D Face Reconstruction Challenge](https://tianchi.aliyun.com/competition/entrance/531961/introduction)
-of [ECCV-2022 WCPA Workshop](https://sites.google.com/view/wcpa2022), [paper](https://arxiv.org/abs/2208.07142) and [code](reconstruction/jmlr).
-
-**`2022-03-30`**: [Partial FC](https://arxiv.org/abs/2203.15565) accepted by CVPR-2022.
-
-**`2022-02-23`**: [SCRFD](detection/scrfd) accepted by [ICLR-2022](https://iclr.cc/Conferences/2022).
-
-**`2021-11-30`**: [MFR-Ongoing](challenges/mfr) challenge launched(same with IFRT), which is an extended version of [iccv21-mfr](challenges/iccv21-mfr).
-
-**`2021-10-29`**: We achieved 1st place on the [VISA track](https://pages.nist.gov/frvt/plots/11/visa.html) of [NIST-FRVT 1:1](https://pages.nist.gov/frvt/html/frvt11.html) by using Partial FC (Xiang An, Jiankang Deng, Jia Guo).
-
-**`2021-10-11`**: [Leaderboard](https://insightface.ai/mfr21) of [ICCV21 - Masked Face Recognition Challenge](challenges/iccv21-mfr) released. Video: [Youtube](https://www.youtube.com/watch?v=lL-7l5t6x2w), [Bilibili](https://www.bilibili.com/video/BV15b4y1h79N/).
-
-**`2021-06-05`**: We launch a [Masked Face Recognition Challenge & Workshop](challenges/iccv21-mfr) on ICCV 2021.
-
-
-
-## Introduction
-
-[InsightFace](https://insightface.ai) is an open source 2D&3D deep face analysis toolbox, mainly based on PyTorch and MXNet. 
-
-Please check our [website](https://insightface.ai) for detail.
-
-The master branch works with **PyTorch 1.6+** and/or **MXNet=1.6-1.8**, with **Python 3.x**.
-
-InsightFace efficiently implements a rich variety of state of the art algorithms of face recognition, face detection and face alignment, which optimized for both training and deployment.
-
-## Quick Start
-
-Please start with our [python-package](python-package/), for testing detection, recognition and alignment models on input images.
-
-
-### ArcFace Video Demo
-
-
-[<img src=https://raw.githubusercontent.com/nttstar/insightface-resources/refs/heads/master/images/facerecognitionfromvideo.PNG width="760" />](https://www.youtube.com/watch?v=y-D1tReryGA&t=81s)
-
-
-Please click the image to watch the Youtube video. For Bilibili users, click [here](https://www.bilibili.com/video/av38041494?from=search&seid=11501833604850032313).
-
-
-
-## Projects
-
-The [page](https://insightface.ai/projects) on InsightFace website also describes all supported projects in InsightFace.
-
-You may also interested in some [challenges](https://insightface.ai/challenges) hold by InsightFace.
-
-
-
-## Face Recognition
-
-### Introduction
-
-In this module, we provide training data, network settings and loss designs for deep face recognition.
-
-The supported methods are as follows:
-
-- [x] [ArcFace_mxnet (CVPR'2019)](recognition/arcface_mxnet)
-- [x] [ArcFace_torch (CVPR'2019)](recognition/arcface_torch)
-- [x] [SubCenter ArcFace (ECCV'2020)](recognition/subcenter_arcface)
-- [x] [PartialFC_mxnet (CVPR'2022)](recognition/partial_fc)
-- [x] [PartialFC_torch (CVPR'2022)](recognition/arcface_torch)
-- [x] [VPL (CVPR'2021)](recognition/vpl)
-- [x] [Arcface_oneflow](recognition/arcface_oneflow)
-- [x] [ArcFace_Paddle (CVPR'2019)](recognition/arcface_paddle)
-
-Commonly used network backbones are included in most of the methods, such as IResNet, MobilefaceNet, MobileNet, InceptionResNet_v2, DenseNet, etc..
-
-
-### Datasets
-
-The training data includes, but not limited to the cleaned MS1M, VGG2 and CASIA-Webface datasets, which were already packed in MXNet binary format. Please [dataset](recognition/_datasets_) page for detail.
-
-### Evaluation
-
-We provide standard IJB and Megaface evaluation pipelines in [evaluation](recognition/_evaluation_)
-
-
-### Pretrained Models
-
-**Please check [Model-Zoo](https://github.com/deepinsight/insightface/wiki/Model-Zoo) for more pretrained models.**
-
-### Third-party Re-implementation of ArcFace
-
-- TensorFlow: [InsightFace_TF](https://github.com/auroua/InsightFace_TF)
-- TensorFlow: [tf-insightface](https://github.com/AIInAi/tf-insightface)
-- TensorFlow:[insightface](https://github.com/Fei-Wang/insightface)
-- PyTorch: [InsightFace_Pytorch](https://github.com/TreB1eN/InsightFace_Pytorch)
-- PyTorch: [arcface-pytorch](https://github.com/ronghuaiyang/arcface-pytorch)
-- Caffe: [arcface-caffe](https://github.com/xialuxi/arcface-caffe)
-- Caffe: [CombinedMargin-caffe](https://github.com/gehaocool/CombinedMargin-caffe)
-- Tensorflow: [InsightFace-tensorflow](https://github.com/luckycallor/InsightFace-tensorflow)
-- TensorRT: [wang-xinyu/tensorrtx](https://github.com/wang-xinyu/tensorrtx)  
-- TensorRT: [InsightFace-REST](https://github.com/SthPhoenix/InsightFace-REST)
-- ONNXRuntime C++: [ArcFace-ONNXRuntime](https://github.com/DefTruth/lite.ai.toolkit/blob/main/lite/ort/cv/glint_arcface.cpp)
-- ONNXRuntime Go: [arcface-go](https://github.com/jack139/arcface-go)
-- MNN: [ArcFace-MNN](https://github.com/DefTruth/lite.ai.toolkit/blob/main/lite/mnn/cv/mnn_glint_arcface.cpp)
-- TNN: [ArcFace-TNN](https://github.com/DefTruth/lite.ai.toolkit/blob/main/lite/tnn/cv/tnn_glint_arcface.cpp)
-- NCNN: [ArcFace-NCNN](https://github.com/DefTruth/lite.ai.toolkit/blob/main/lite/ncnn/cv/ncnn_glint_arcface.cpp)
-
-## Face Detection
-
-### Introduction
-
-<div align="left">
-  <img src="https://raw.githubusercontent.com/nttstar/insightface-resources/refs/heads/master/images/11513D05.jpg" width="640"/>
-</div>
-
-In this module, we provide training data with annotation, network settings and loss designs for face detection training, evaluation and inference.
-
-The supported methods are as follows:
-
-- [x] [RetinaFace (CVPR'2020)](detection/retinaface)
-- [x] [SCRFD (Arxiv'2021)](detection/scrfd)
-- [x] [blazeface_paddle](detection/blazeface_paddle)
-
-[RetinaFace](detection/retinaface) is a practical single-stage face detector which is accepted by [CVPR 2020](https://openaccess.thecvf.com/content_CVPR_2020/html/Deng_RetinaFace_Single-Shot_Multi-Level_Face_Localisation_in_the_Wild_CVPR_2020_paper.html). We provide training code, training dataset, pretrained models and evaluation scripts. 
-
-[SCRFD](detection/scrfd) is an efficient high accuracy face detection approach which is initialy described in [Arxiv](https://arxiv.org/abs/2105.04714). We provide an easy-to-use pipeline to train high efficiency face detectors with NAS supporting.
-
-
-## Face Alignment
-
-### Introduction
-
-<div align="left">
-  <img src="https://raw.githubusercontent.com/nttstar/insightface-resources/refs/heads/master/images/thumb_sdunet.png" width="600"/>
-</div>
-
-In this module, we provide datasets and training/inference pipelines for face alignment.
-
-Supported methods:
-
-- [x] [SDUNets (BMVC'2018)](alignment/heatmap)
-- [x] [SimpleRegression](alignment/coordinate_reg)
-
-
-[SDUNets](alignment/heatmap) is a heatmap based method which accepted on [BMVC](http://bmvc2018.org/contents/papers/0051.pdf).
-
-[SimpleRegression](alignment/coordinate_reg) provides very lightweight facial landmark models with fast coordinate regression. The input of these models is loose cropped face image while the output is the direct landmark coordinates.
-
-
-## Citation
-
-If you find *InsightFace* useful in your research, please consider to cite the following related papers:
+두 프로그램은 아래 공유 폴더를 통해 파일로 주고받습니다. 설치 경로가 달라도 항상 같은 위치를 씁니다.
 
 ```
-@inproceedings{ren2023pbidr,
-  title={Facial Geometric Detail Recovery via Implicit Representation},
-  author={Ren, Xingyu and Lattas, Alexandros and Gecer, Baris and Deng, Jiankang and Ma, Chao and Yang, Xiaokang},
-  booktitle={2023 IEEE 17th International Conference on Automatic Face and Gesture Recognition (FG)},  
-  year={2023}
- }
-
-@article{guo2021sample,
-  title={Sample and Computation Redistribution for Efficient Face Detection},
-  author={Guo, Jia and Deng, Jiankang and Lattas, Alexandros and Zafeiriou, Stefanos},
-  journal={arXiv preprint arXiv:2105.04714},
-  year={2021}
-}
-
-@inproceedings{gecer2021ostec,
-  title={OSTeC: One-Shot Texture Completion},
-  author={Gecer, Baris and Deng, Jiankang and Zafeiriou, Stefanos},
-  booktitle={Proceedings of the IEEE/CVF Conference on Computer Vision and Pattern Recognition (CVPR)},
-  year={2021}
-}
-
-@inproceedings{an_2022_pfc_cvpr,
-  title={Killing Two Birds with One Stone: Efficient and Robust Training of Face Recognition CNNs by Partial FC},
-  author={An, Xiang and Deng, Jiangkang and Guo, Jia and Feng, Ziyong and Zhu, Xuhan and Jing, Yang and Tongliang, Liu},
-  booktitle={CVPR},
-  year={2022}
-}
-@inproceedings{an_2021_pfc_iccvw,
-  title={Partial FC: Training 10 Million Identities on a Single Machine},
-  author={An, Xiang and Zhu, Xuhan and Gao, Yuan and Xiao, Yang and Zhao, Yongle and Feng, Ziyong and Wu, Lan and Qin, Bin and Zhang, Ming and Zhang, Debing and Fu, Ying},
-  booktitle={ICCVW},
-  year={2021},
-}
-
-
-@inproceedings{deng2020subcenter,
-  title={Sub-center ArcFace: Boosting Face Recognition by Large-scale Noisy Web Faces},
-  author={Deng, Jiankang and Guo, Jia and Liu, Tongliang and Gong, Mingming and Zafeiriou, Stefanos},
-  booktitle={Proceedings of the IEEE Conference on European Conference on Computer Vision},
-  year={2020}
-}
-
-@inproceedings{Deng2020CVPR,
-title = {RetinaFace: Single-Shot Multi-Level Face Localisation in the Wild},
-author = {Deng, Jiankang and Guo, Jia and Ververas, Evangelos and Kotsia, Irene and Zafeiriou, Stefanos},
-booktitle = {CVPR},
-year = {2020}
-}
-
-@inproceedings{guo2018stacked,
-  title={Stacked Dense U-Nets with Dual Transformers for Robust Face Alignment},
-  author={Guo, Jia and Deng, Jiankang and Xue, Niannan and Zafeiriou, Stefanos},
-  booktitle={BMVC},
-  year={2018}
-}
-
-@article{deng2018menpo,
-  title={The Menpo benchmark for multi-pose 2D and 3D facial landmark localisation and tracking},
-  author={Deng, Jiankang and Roussos, Anastasios and Chrysos, Grigorios and Ververas, Evangelos and Kotsia, Irene and Shen, Jie and Zafeiriou, Stefanos},
-  journal={IJCV},
-  year={2018}
-}
-
-@inproceedings{deng2018arcface,
-title={ArcFace: Additive Angular Margin Loss for Deep Face Recognition},
-author={Deng, Jiankang and Guo, Jia and Niannan, Xue and Zafeiriou, Stefanos},
-booktitle={CVPR},
-year={2019}
-}
+%USERPROFILE%\SeatManagerApp\face-integration\
+├── roster.json       창공시스템 → 얼굴인식 (학생 명단, 학생 등록 시 자동 입력)
+└── attendance.json   얼굴인식 → 창공시스템 (출근/퇴근 기록, 출결 처리할 때마다 갱신)
 ```
 
-## Contributing
+## 3. 출결 인정 규칙
 
-Main contributors:
+- **주 20시간 이상, 주 3일 이상** (월요일~일요일 기준)
+- **06:00 ~ 24:00** 사이에 찍은 출근/퇴근만 인정 (00:00~06:00 기록은 남지만 인정되지 않음)
+- **퇴근까지 찍어야 시간이 인정**됨. 출근만 찍은 날은 출근 일수만 인정
+- 하루에 여러 번 출퇴근 가능. 출근→퇴근 한 쌍마다 시간을 더함
+- 퇴근하지 않은 상태에서 다시 출근을 누르면 `이미 출근 완료 되었습니다` 안내 후 기록되지 않음
+- 기준에 못 미친 부족 일수·시간은 학생 화면에 **빨간색**으로 표시
 
-- [Jia Guo](https://github.com/nttstar), ``guojia[at]gmail.com``
-- [Jiankang Deng](https://github.com/jiankangdeng) ``jiankangdeng[at]gmail.com``
-- [Xiang An](https://github.com/anxiangsir) ``anxiangsir[at]gmail.com``
-- [Jack Yu](https://github.com/szad670401) ``jackyu961127[at]gmail.com``
-- [Baris Gecer](https://barisgecer.github.io/) ``barisgecer[at]msn.com``
- ``
+## 4. 부정 출석 방지
+
+네 단계로 막습니다.
+
+1. **얼굴인식** — 등록된 학생만 화면에 뜸
+2. **본인 비밀번호** — 출근/퇴근을 누르면 비밀번호를 한 번 더 확인
+3. **위조판별 (InsightFace liveness 애드온)** — 얼굴마다 실제 사람 점수를 매겨, 사진이나 휴대폰 화면이면
+   출결·학생 등록을 차단합니다. 카메라 상태바에 `⛔ 사진/화면으로 판단됨`이 표시됩니다.
+4. **눈 깜빡임 확인 (MediaPipe)** — 최근 10초 안에 눈을 감았다 뜬 적이 있어야 진행됩니다.
+   위조판별 애드온을 못 쓰는 환경(인터넷 없음, 구버전 등)에서의 2차 방어입니다.
+   깜빡임은 **인식된 얼굴 영역에서만** 검사합니다. 화면 전체로 보면 사진을 들고 있는 사람의 깜빡임이
+   대신 잡혀 사진이 통과하기 때문입니다.
+
+> 위조판별 모델은 처음 실행할 때 `~/.insightface/addons/liveness.onnx`로 자동 다운로드되고 SHA256로 검증됩니다.
+> 모드는 `observe`라서, 가짜로 판정돼도 얼굴 인식 자체는 계속하고 안내 문구를 띄웁니다.
+
+## 5. 화면 구성
+
+- **기본 화면** — 카메라 영상 + 관리자 로그인 카드
+- **학생 카드** (얼굴이 인식되면 자동 표시)
+  - 이번주 출근 일수 / 출근 시간 / 부족분
+  - **오늘 출근 시간** — 출근 중이면 1초마다 갱신
+  - 패널티 현황, 이름·학번·전공, [출근] / [퇴근] 버튼
+- **관리자 화면** (로그인 후)
+  - 학생 현황/수정 — 이름·전공·패널티 수정, 선택/일괄 삭제
+  - 학생 등록 — 창공시스템 명단에서 선택 후 카메라로 얼굴 등록
+  - 전체 출결로그 — 오늘/최근 7일/월 단위/기간 직접 선택, 주 3회·20시간 충족자 조회, 엑셀 추출
+
+## 6. 설치 및 실행 (다른 PC 포함)
+
+**준비물:** Windows, Python 3.10 이상, 웹캠, 최초 1회 인터넷 연결
+
+```bash
+pip install -r requirements.txt
+```
+
+```bash
+python attendance_app.py
+```
+
+처음 실행할 때 자동으로 준비되는 것들입니다.
+
+- **InsightFace 모델(buffalo_l)** — `~/.insightface/models`에 자동 다운로드 (약 300MB, 최초 1회)
+- **위조판별 모델(liveness.onnx)** — `~/.insightface/addons`에 자동 다운로드 (최초 1회). insightface 2.0 이상 필요
+- **깜빡임 검사 모델(`face_landmarker.task`)** — 프로젝트 폴더에 자동 다운로드 (약 3.7MB, 최초 1회).
+  저장소에 파일이 같이 있으면 그대로 사용합니다. 인터넷이 없어 받지 못하면 **깜빡임 검사만 꺼진 채로** 정상 실행됩니다.
+- **`faces.db`** — 없으면 새로 만들고, 기본 관리자 계정(아이디 `1234` / 비밀번호 `1234`)을 생성합니다.
+
+DB와 모델은 `attendance_app.py`가 있는 폴더를 기준으로 찾으므로, 어느 폴더에서 실행해도 동작합니다.
+
+> **보안 주의:** 기본 관리자 계정이 `1234` / `1234`입니다. 실제 운영에 쓰기 전에 반드시 변경하세요.
+> `faces.db`에는 학생 얼굴 임베딩과 비밀번호가 들어 있으므로 공개 저장소에 올릴 때 주의가 필요합니다.
+
+## 7. 주요 설정값
+
+[attendance_app.py](attendance_app.py) 맨 위에서 바꿀 수 있습니다.
+
+| 설정 | 기본값 | 설명 |
+| --- | --- | --- |
+| `THRESHOLD` | 0.50 | 얼굴 동일인 판정 기준 (코사인 유사도) |
+| `WEEKLY_REQUIRED_SECONDS` | 20시간 | 주간 필수 출석 시간 |
+| `WEEKLY_REQUIRED_DAYS` | 3일 | 주간 필수 출석 일수 |
+| `VALID_ATTENDANCE_START` | 06:00:00 | 이 시각 이후 기록만 인정 |
+| `LIVENESS_THRESHOLD` | 0.8 | 실제 사람 판정 기준 점수 (낮출수록 통과가 쉬워짐) |
+| `LIVENESS_VALID_SECONDS` | 3초 | 출결 전 실제 사람 판정 유효 시간 |
+| `BLINK_CLOSED_SCORE` / `BLINK_OPEN_SCORE` | 0.5 / 0.3 | 눈 감음/뜸 판정 기준 |
+| `BLINK_VALID_SECONDS` | 10초 | 출결 전 깜빡임 유효 시간 |
+| `INFERENCE_THREADS` | CPU 코어 수 ÷ 3 | 얼굴인식에 쓸 스레드 수 (화면 끊김 방지) |
+
+## 8. 구조
+
+```
+attendance_app.py
+├── 얼굴인식 전용 프로세스   InsightFace(인식+위조판별) + MediaPipe를 별도 프로세스에서 실행 (UI 끊김 방지)
+├── 카메라 스레드            웹캠에서 최신 프레임만 유지
+├── DB / 통계 함수           출퇴근 기록, 출근→퇴근 쌍 묶기, 주간·오늘 집계
+└── Tkinter UI               기본 화면 / 학생 카드 / 관리자 화면
+```
+
+`faces.db` 테이블
+
+- `users` — 학번, 비밀번호, 이름, 전공, 권한(admin/student), 얼굴 임베딩, 패널티
+- `attendance_logs` — 학번, 이름, 구분(CHECK_IN/CHECK_OUT), 날짜, 시간
+
+---
+
+이 저장소는 [InsightFace](https://github.com/deepinsight/insightface)를 기반으로 만들어졌습니다.
+원본 프로젝트 문서는 [python-package/](python-package/)와 [server/](server/) 폴더를 참고하세요.

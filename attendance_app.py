@@ -29,6 +29,11 @@ LIVENESS_MODEL_URL = (
 BLINK_CLOSED_SCORE = 0.5    # 이 값을 넘으면 눈을 감은 것으로 본다
 BLINK_OPEN_SCORE = 0.3      # 다시 이 아래로 내려오면 한 번 깜빡인 것으로 센다
 BLINK_VALID_SECONDS = 10    # 출퇴근을 누르기 전 이 시간 안에 깜빡임이 있어야 한다
+
+# InsightFace 공식 위조판별(liveness) 애드온 기준 점수. 이 값 이상이면 실제 사람으로 본다.
+# 모델은 처음 실행할 때 ~/.insightface/addons/liveness.onnx 로 자동 다운로드된다.
+LIVENESS_THRESHOLD = 0.8
+LIVENESS_VALID_SECONDS = 3  # 출퇴근을 누르기 전 이 시간 안에 '실제 사람' 판정이 있어야 한다
 RIGHT_PANEL_WIDTH = 620  # 우측 UI 패널 폭 — 1600x900 기준 값이고, 실제로는 px()로 화면 배율을 곱해서 쓴다
 
 # 기준 창 크기(창공시스템과 동일). 모니터가 이보다 작으면 UI_SCALE만큼 전체를 줄여서 띄운다.
@@ -105,12 +110,28 @@ def create_blink_detector():
         return None
 
 
+def crop_face_region(frame, bbox, margin=0.35):
+    """얼굴 bbox 주변을 여유 있게 잘라낸다. 화면 밖으로 나가지 않게 잘라서 돌려준다."""
+    h, w = frame.shape[:2]
+    x1, y1, x2, y2 = [float(v) for v in bbox[:4]]
+    mx, my = (x2 - x1) * margin, (y2 - y1) * margin
+    x1 = max(0, int(x1 - mx))
+    y1 = max(0, int(y1 - my))
+    x2 = min(w, int(x2 + mx))
+    y2 = min(h, int(y2 + my))
+    if x2 - x1 < 20 or y2 - y1 < 20:
+        return None
+    return frame[y1:y2, x1:x2]
+
+
 def detect_blink_score(landmarker, frame, timestamp_ms):
     """
     프레임에서 눈이 감긴 정도(0~1)를 구한다. 양쪽 눈 중 더 크게 감긴 쪽 값을 쓴다.
     얼굴을 못 찾았거나 검사가 꺼져 있으면 None.
+    주의: 인식 대상 얼굴만 잘라서 넘겨야 한다. 화면 전체를 넘기면 사진을 들고 있는
+    사람의 깜빡임이 대신 잡혀서 사진이 통과해 버린다.
     """
-    if landmarker is None:
+    if landmarker is None or frame is None or frame.size == 0:
         return None
     try:
         import mediapipe as mp
@@ -129,11 +150,26 @@ def face_inference_process(conn, threads):
     import onnxruntime
     from insightface.app import FaceAnalysis
 
-    app = FaceAnalysis(
-        name="buffalo_l",
-        allowed_modules=['detection', 'recognition'],
-        providers=["CPUExecutionProvider"]
-    )
+    # addons=["liveness"] — InsightFace 공식 위조판별(사진/화면 판별) 애드온.
+    # observe 모드로 두면 가짜로 보여도 얼굴 인식은 그대로 하고, 판정 결과만 받아서
+    # "사진으로 보입니다" 같은 안내를 우리 쪽에서 띄울 수 있다.
+    try:
+        app = FaceAnalysis(
+            name="buffalo_l",
+            allowed_modules=['detection', 'recognition'],
+            addons=["liveness"],
+            liveness_mode="observe",
+            liveness_threshold=LIVENESS_THRESHOLD,
+            providers=["CPUExecutionProvider"]
+        )
+    except Exception as e:
+        # 구버전 insightface이거나 애드온을 못 받은 경우 — 위조판별 없이 그대로 동작한다
+        print(f"[출석] 위조판별 애드온을 쓸 수 없습니다 ({e}). 깜빡임 검사만 사용합니다.")
+        app = FaceAnalysis(
+            name="buffalo_l",
+            allowed_modules=['detection', 'recognition'],
+            providers=["CPUExecutionProvider"]
+        )
     app.prepare(ctx_id=0, det_size=(256, 256))
 
     # onnxruntime은 기본으로 CPU 코어를 전부 써서 카메라/화면 쪽이 밀린다.
@@ -153,9 +189,22 @@ def face_inference_process(conn, threads):
     while True:
         frame = conn.recv()
         faces = app.get(frame)
-        # MediaPipe VIDEO 모드는 타임스탬프가 계속 커져야 한다
-        blink_score = detect_blink_score(blink_landmarker, frame, int(time.perf_counter() * 1000))
-        conn.send(([(f.bbox, f.embedding) for f in faces], blink_score))
+
+        # 깜빡임은 "인식된 얼굴"에서만 본다. 화면 전체로 보면 사진을 들고 있는 사람의
+        # 깜빡임이 대신 잡혀서 사진이 통과한다. 가장 큰 얼굴(= 인식 대상)만 잘라서 검사한다.
+        blink_score = None
+        liveness = None   # (is_live, status) — 위조판별 애드온 결과
+        if faces:
+            main_face = max(faces, key=lambda f: (f.bbox[2] - f.bbox[0]) * (f.bbox[3] - f.bbox[1]))
+            face_crop = crop_face_region(frame, main_face.bbox)
+            # MediaPipe VIDEO 모드는 타임스탬프가 계속 커져야 한다
+            blink_score = detect_blink_score(blink_landmarker, face_crop, int(time.perf_counter() * 1000))
+
+            result = getattr(main_face, "liveness", None)
+            if result is not None:
+                liveness = (result.is_live, result.status)
+
+        conn.send(([(f.bbox, f.embedding) for f in faces], blink_score, liveness))
 
 
 def px(value):
@@ -527,11 +576,11 @@ def get_today_attendance_status(user_id):
     sessions = pair_attendance_sessions(logs)
     finished_seconds = int(sum(session_seconds(s) for s in sessions))
 
-    # 출근만 찍고 퇴근을 안 찍은 기록이 있으면 지금 출근 중인 것으로 본다
+    # 지금 출근 중인지는 "오늘의 마지막 기록이 출근인지"로 본다.
+    # 짝이 안 맞는 예전 기록(중복 출근 등)이 남아 있어도 퇴근을 찍으면 바로 멈추게 하기 위함이다.
     working_since = None
-    for session in sessions:
-        if session["check_in"] and not session["check_out"]:
-            working_since = session["check_in"]
+    if logs and logs[-1][3] == "CHECK_IN":
+        working_since = logs[-1][4]
 
     working_seconds = 0
     if working_since:
@@ -550,6 +599,13 @@ def get_today_attendance_status(user_id):
 def log_attendance(user_id, name, log_type):
     today_date = datetime.now().strftime("%Y-%m-%d")
     now_time = datetime.now().strftime("%H:%M:%S")
+
+    # 하루에 여러 번 출퇴근할 수 있지만, 퇴근을 안 한 상태에서 또 출근을 누르는 것은 막는다
+    if log_type == 'CHECK_IN' and is_valid_attendance_time(now_time):
+        working_since = get_today_attendance_status(user_id)["working_since"]
+        if working_since:
+            return False, (f"이미 출근 완료 되었습니다. ({working_since} 출근)\n"
+                           "퇴근을 먼저 찍은 뒤에 다시 출근할 수 있습니다.")
 
     conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
@@ -937,7 +993,12 @@ class StudentInfoFrame(tk.Frame):
             self._today_after_id = None
 
     def handle_action(self, log_type):
-        # 사진/화면으로 얼굴을 들이대는 것 차단 — 최근에 눈을 깜빡인 적이 있어야 한다
+        # 1차 차단 — InsightFace 위조판별 애드온 (사진/화면 판별)
+        if not self.parent.passes_antispoof():
+            messagebox.showerror("본인 확인 실패", self.parent.liveness_reject_message())
+            return
+
+        # 2차 차단 — 눈 깜빡임 (애드온을 못 쓰는 환경에서도 사진은 막히도록)
         if not self.parent.has_recent_blink():
             messagebox.showerror(
                 "본인 확인 실패",
@@ -1674,7 +1735,11 @@ class AdminDashboardFrame(tk.Frame):
             messagebox.showerror("얼굴 인식 실패", "카메라 영역에 등록할 학생의 얼굴이 감지되지 않았습니다.")
             return
 
-        # 사진으로 학생이 등록되면 이후 출석도 사진으로 뚫리므로 등록할 때도 깜빡임을 확인한다
+        # 사진으로 학생이 등록되면 이후 출석도 사진으로 뚫리므로 등록할 때도 사람인지 확인한다
+        if not self.parent.passes_antispoof():
+            messagebox.showerror("얼굴 인식 실패", self.parent.liveness_reject_message())
+            return
+
         if not self.parent.has_recent_blink():
             messagebox.showerror(
                 "얼굴 인식 실패",
@@ -1815,6 +1880,12 @@ class AttendanceApp:
         self.last_blink_time = 0.0
         self._eye_closed = False
 
+        # InsightFace 위조판별 애드온 상태 (애드온이 결과를 보내주면 켜진다)
+        self.antispoof_enabled = False
+        self.last_live_time = 0.0
+        self.last_fake_time = 0.0
+        self.last_liveness_status = None
+
         # UI 레이아웃 구성
         self.create_widgets()
 
@@ -1940,10 +2011,11 @@ class AttendanceApp:
                 if self.camera_on and frame is not None and seq != last_seq:
                     last_seq = seq
                     self.face_conn.send(frame)
-                    results, blink_score = self.face_conn.recv()
+                    results, blink_score, liveness = self.face_conn.recv()
                     if self.camera_on:  # 분석 중에 화면을 껐다면 예전 얼굴을 남기지 않는다
                         self.cached_faces = [DetectedFace(bbox, emb) for bbox, emb in results]
                         self._update_blink_state(blink_score)
+                        self._update_liveness_state(liveness)
                 else:
                     time.sleep(0.005)
         except (EOFError, OSError):
@@ -1970,6 +2042,43 @@ class AttendanceApp:
         if not self.liveness_enabled:
             return True
         return (time.time() - self.last_blink_time) <= BLINK_VALID_SECONDS
+
+    def _update_liveness_state(self, liveness):
+        """
+        InsightFace 위조판별 애드온 결과를 기록한다.
+        liveness = (is_live, status) 또는 None(애드온 없음/얼굴 없음)
+        """
+        if liveness is None:
+            return
+
+        is_live, status = liveness
+        self.antispoof_enabled = True
+        self.last_liveness_status = status
+        if status == "ok":
+            if is_live:
+                self.last_live_time = time.time()
+            else:
+                self.last_fake_time = time.time()
+
+    def passes_antispoof(self):
+        """
+        최근 LIVENESS_VALID_SECONDS 안에 '실제 사람' 판정이 있었는지.
+        애드온이 없으면 항상 통과(이때는 깜빡임 검사가 대신 막는다).
+        """
+        if not self.antispoof_enabled:
+            return True
+        return (time.time() - self.last_live_time) <= LIVENESS_VALID_SECONDS
+
+    def liveness_reject_message(self):
+        """위조판별에서 막혔을 때 사용자에게 보여줄 안내 문구."""
+        if (time.time() - self.last_fake_time) <= LIVENESS_VALID_SECONDS:
+            return ("사진이나 화면으로 판단됩니다.\n"
+                    "본인이 직접 카메라 앞에 서서 다시 시도해주세요.")
+        if self.last_liveness_status == "input_rejected":
+            return ("얼굴이 너무 크게 잡혀 확인할 수 없습니다.\n"
+                    "카메라에서 조금 물러난 뒤 다시 시도해주세요.")
+        return ("본인 확인을 하지 못했습니다.\n"
+                "카메라를 정면으로 바라본 뒤 다시 시도해주세요.")
 
     def update_video(self):
         frame = self.latest_frame
@@ -2083,13 +2192,17 @@ class AttendanceApp:
             self._update_liveness_label()
 
     def _update_liveness_label(self):
-        """깜빡임이 확인된 상태인지 카메라 상태바에 표시한다."""
-        if not self.liveness_enabled:
+        """실제 사람으로 확인된 상태인지 카메라 상태바에 표시한다."""
+        if self.antispoof_enabled and (time.time() - self.last_fake_time) <= LIVENESS_VALID_SECONDS:
+            self.lbl_liveness.config(text="⛔ 사진/화면으로 판단됨", fg="#EF4444")
+        elif not (self.antispoof_enabled or self.liveness_enabled):
             self.lbl_liveness.config(text="")
-        elif self.has_recent_blink():
+        elif self.passes_antispoof() and self.has_recent_blink():
             self.lbl_liveness.config(text="👁 사람 확인됨", fg="#10B981")
-        else:
+        elif not self.has_recent_blink():
             self.lbl_liveness.config(text="👁 눈을 깜빡여 주세요", fg="#94A3B8")
+        else:
+            self.lbl_liveness.config(text="👁 카메라를 바라봐 주세요", fg="#94A3B8")
 
     def toggle_camera(self):
         """카메라 화면 표시를 켜고 끈다. 꺼져 있는 동안은 얼굴 인식도 같이 멈춘다."""

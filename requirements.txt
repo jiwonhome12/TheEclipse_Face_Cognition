@@ -13,3 +13,5 @@ onnxruntime>=1.16.0
 # 없으면 아래 주소에서 받는다:
 # https://storage.googleapis.com/mediapipe-models/face_landmarker/face_landmarker/float16/1/face_landmarker.task
 mediapipe>=0.10.0
+# macOS에서 카메라 권한 요청 창을 띄우고 응답을 기다리는 데 사용 (윈도우에서는 설치 안 됨)
+pyobjc-framework-AVFoundation; sys_platform == "darwin"

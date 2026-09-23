@@ -1439,17 +1439,17 @@ class AdminDashboardFrame(tk.Frame):
         self.edit_penalty = ttk.Entry(form_frame, width=4)
         self.edit_penalty.grid(row=0, column=5, padx=5, pady=5)
 
-        btn_update = tButton(form_frame, text="수정 완료", command=self.update_student)
+        btn_update = Button(form_frame, text="수정 완료", command=self.update_student)
         # 입력칸 옆에 두면 화면이 작을 때 잘려서, 입력칸 아래 줄에 폭 전체로 둔다
         btn_update.grid(row=1, column=0, columnspan=6, padx=5, pady=(0, 5), sticky=tk.EW)
         form_frame.columnconfigure(1, weight=2)
         form_frame.columnconfigure(3, weight=3)
 
 
-        btn_del_sel = tButton(btn_action_frame, text="선택 삭제", command=self.delete_selected)
+        btn_del_sel = Button(btn_action_frame, text="선택 삭제", command=self.delete_selected)
         btn_del_sel.pack(fill=tk.X, ipady=4, pady=2)
 
-        btn_del_all = tButton(btn_action_frame, text="일괄 삭제", command=self.delete_all)
+        btn_del_all = Button(btn_action_frame, text="일괄 삭제", command=self.delete_all)
         btn_del_all.pack(fill=tk.X, ipady=4, pady=2)
 
         self.load_students()
@@ -1467,7 +1467,7 @@ class AdminDashboardFrame(tk.Frame):
         self.roster_combo.grid(row=0, column=1, padx=px(10), pady=px(8), sticky=tk.W)
         self.roster_combo.bind("<<ComboboxSelected>>", self.on_roster_selected)
 
-        btn_reload_roster = tButton(grid_container, text="🔄 명단 새로고침", command=lambda: self.reload_roster_combo(show_message_if_empty=True))
+        btn_reload_roster = Button(grid_container, text="🔄 명단 새로고침", command=lambda: self.reload_roster_combo(show_message_if_empty=True))
         btn_reload_roster.grid(row=0, column=2, padx=px(10), pady=px(8), sticky=tk.W)
 
         ttk.Label(grid_container, text="학번(ID):", font=(UI_FONT, 10, "bold"), background="#F8FAFC").grid(row=1, column=0, padx=px(10), pady=px(8), sticky=tk.W)

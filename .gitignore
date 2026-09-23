@@ -112,3 +112,13 @@ server/test-results/
 *.onnx
 
 .DS_Store
+
+# 출석체크 앱 로컬 데이터 — 학생 얼굴 임베딩·비밀번호가 들어 있으므로 저장소에 올리지 않는다
+faces.db
+faces.db-journal
+*.part
+
+# IDE / 에디터 설정
+.vs/
+.vscode/
+.idea/

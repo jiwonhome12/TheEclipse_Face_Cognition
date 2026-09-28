@@ -88,7 +88,23 @@
 
 ## 6. 설치 및 실행 (다른 PC 포함)
 
-### 윈도우 무인 운영 PC에 설치하기 (권장)
+### 가장 쉬운 방법 — exe 설치판 (파이썬 설치 필요 없음)
+
+1. GitHub 저장소의 **[Releases]** 에서 최신 **`TheEclipseAttendance-windows.zip`** 을 내려받습니다.
+2. `C:\TheEclipseAttendance` 같은 폴더에 압축을 풀고 **`install.bat`** 을 더블클릭합니다.
+   ("Windows의 PC 보호" 창이 뜨면 [추가 정보] → [실행])
+   - 얼굴 인식 모델(약 300MB)을 처음 한 번 내려받고, 카메라·얼굴 인식 **자가진단 결과**를 보여줍니다.
+   - 매일 06:00 자동 실행, 00:00 자동 종료, 로그인 시 자동 실행, 바탕화면 바로가기를 설정합니다.
+3. 바탕화면의 **[창의공간 출석체크]** 로 실행합니다.
+
+> InsightFace 얼굴 모델(buffalo_l)은 비상업 연구용 라이선스라 zip에 넣지 않고, 처음 실행할 때 공식 주소에서 받습니다.
+>
+> **새 배포판 만들기:** `powershell -ExecutionPolicy Bypass -File packaging\build_release.ps1` 로
+> `dist\TheEclipseAttendance-windows.zip` 을 만든 뒤, GitHub [Releases] → [Draft a new release] 에 올립니다.
+> 태그만 올리면 자동으로 빌드되게 하려면 [packaging/github-actions/release-windows.yml](packaging/github-actions/release-windows.yml) 을
+> `.github/workflows/` 로 옮기세요.
+
+### 소스로 설치하기 — 윈도우 무인 운영 PC (파이썬 사용)
 
 매일 **06:00에 자동으로 켜지고 00:00에 자동으로 꺼지는** 출석 PC로 설치합니다.
 

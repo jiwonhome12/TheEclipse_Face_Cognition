@@ -1,0 +1,53 @@
+# 사용하려면 이 파일을 .github/workflows/ 로 옮겨서 올리세요.
+# (GitHub 로그인에 'workflow' 권한이 있어야 올라갑니다 — GitHub Desktop이나 웹에서 파일을 추가하면 됩니다)
+# v* 태그를 올리면 윈도우 exe 배포판을 빌드해서 GitHub Releases에 다운로드 파일로 올린다.
+#   git tag v1.0.0 && git push origin v1.0.0
+name: Windows 배포판 빌드
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:   # Actions 탭에서 수동 실행 (빌드 결과는 Artifacts로만 받을 수 있음)
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: 패키지 설치
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt pyinstaller
+
+      - name: exe 빌드 + zip
+        shell: pwsh
+        run: ./packaging/build_release.ps1
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: TheEclipseAttendance-windows
+          path: dist/TheEclipseAttendance-windows.zip
+
+      - name: Release에 올리기
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/TheEclipseAttendance-windows.zip
+          body: |
+            ## 창의공간 얼굴인식 출석체크 — 윈도우 설치판
+            파이썬 설치 없이 바로 쓰는 버전입니다.
+
+            1. 아래 **TheEclipseAttendance-windows.zip** 을 받아 `C:\TheEclipseAttendance` 같은 폴더에 압축을 풉니다.
+            2. `install.bat` 을 더블클릭합니다. ("Windows의 PC 보호" 창이 뜨면 [추가 정보] → [실행])
+               처음 한 번 얼굴 인식 모델(약 300MB)을 내려받으므로 인터넷이 필요합니다.
+            3. 바탕화면의 **창의공간 출석체크** 로 실행합니다. 매일 06:00 자동 실행, 00:00 자동 종료.
+
+            자세한 내용은 zip 안의 `README.txt` 를 보세요.

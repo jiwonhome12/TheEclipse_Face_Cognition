@@ -16,7 +16,14 @@ from tkinter import font as tkfont
 from PIL import Image, ImageDraw, ImageFont, ImageTk
 
 # 프로그램 파일이 있는 폴더 — 어느 폴더에서 실행해도 같은 DB/모델을 쓰도록 기준으로 삼는다
-APP_DIR = os.path.dirname(os.path.abspath(__file__))
+# exe(PyInstaller)로 실행하면 데이터(DB·사진·로그)는 exe 옆에, 같이 묶은 파일은 _internal 폴더에 있다.
+IS_FROZEN = getattr(sys, "frozen", False)
+if IS_FROZEN:
+    APP_DIR = os.path.dirname(os.path.abspath(sys.executable))
+    RESOURCE_DIR = getattr(sys, "_MEIPASS", APP_DIR)
+else:
+    APP_DIR = os.path.dirname(os.path.abspath(__file__))
+    RESOURCE_DIR = APP_DIR
 
 # 콘솔 없이(pythonw, 작업 스케줄러) 실행하면 sys.stdout/stderr가 None이라 모델 로딩 중
 # 진행 표시 등이 출력하다 죽을 수 있다. 이때는 logs/app.log 파일로 남긴다.
@@ -32,7 +39,7 @@ THRESHOLD = 0.50
 
 # 사진/화면 영상으로 대리 출석하는 것을 막기 위한 눈 깜빡임 검사 (MediaPipe FaceLandmarker)
 # 모델 파일이 없으면 검사는 자동으로 꺼지고, 출퇴근은 예전처럼 그대로 동작한다.
-LIVENESS_MODEL_PATH = os.path.join(APP_DIR, "face_landmarker.task")
+LIVENESS_MODEL_PATH = os.path.join(RESOURCE_DIR, "face_landmarker.task")
 LIVENESS_MODEL_URL = (
     "https://storage.googleapis.com/mediapipe-models/face_landmarker/"
     "face_landmarker/float16/1/face_landmarker.task"
@@ -163,7 +170,8 @@ def create_blink_detector():
             output_face_blendshapes=True,   # eyeBlinkLeft / eyeBlinkRight 값을 쓰기 위해
             num_faces=1,
         ))
-    except Exception:
+    except Exception as e:
+        print(f"[출석] 깜빡임 검사를 켜지 못했습니다 ({type(e).__name__}: {e})")
         return None
 
 
@@ -201,6 +209,22 @@ def detect_blink_score(landmarker, frame, timestamp_ms):
         return None
     scores = {b.category_name: b.score for b in result.face_blendshapes[0]}
     return max(scores.get("eyeBlinkLeft", 0.0), scores.get("eyeBlinkRight", 0.0))
+
+
+_instance_mutex = None
+
+
+def acquire_single_instance():
+    """윈도우 명명 뮤텍스로 프로그램이 하나만 켜지게 한다. 이미 켜져 있으면 False. (윈도우 외에는 항상 True)"""
+    global _instance_mutex
+    if not IS_WINDOWS:
+        return True
+    import ctypes
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.CreateMutexW.restype = ctypes.c_void_p
+    _instance_mutex = kernel32.CreateMutexW(None, False, "Local\\TheEclipseAttendance")
+    ERROR_ALREADY_EXISTS = 183
+    return ctypes.get_last_error() != ERROR_ALREADY_EXISTS
 
 
 def create_face_app():
@@ -2386,6 +2410,7 @@ class AttendanceApp:
         self._candidate_since = 0.0
         self._popups = []               # 결과 안내창 / 출석 조회 창 — 다음 사람이 버튼을 누르면 닫는다
         self.ai_ready = False           # 얼굴 인식 모델 로딩이 끝났는지
+        self.ai_failed = False          # 모델을 받지 못했거나 인식 프로세스가 죽었는지
         self.camera_on = False          # 캡처 스레드가 이 값에 맞춰 카메라 장치를 열고 닫는다
         self.camera_error = False
         self.camera_generation = 0      # 카메라를 켜고 끌 때마다 1씩 증가 — 이전 세션의 늦은 인식 결과를 버리는 데 쓴다
@@ -2547,6 +2572,11 @@ class AttendanceApp:
         tk.Label(inner, text="06:00~24:00 출퇴근만 인정 · 퇴근을 찍어야 시간 인정",
                  font=(UI_FONT, 10), bg="white", fg="#94A3B8").pack(pady=(px(32), 0))
 
+        # 얼굴 인식 준비 상태 — 처음 실행하면 모델(약 300MB)을 받느라 몇 분 걸린다 (_update_clock에서 갱신)
+        self.lbl_ai_status = tk.Label(inner, text="", font=(UI_FONT, 11, "bold"), bg="white", fg="#F59E0B",
+                                      justify=tk.CENTER)
+        self.lbl_ai_status.pack(pady=(px(12), 0))
+
     def capture_worker(self):
         """
         camera_on에 맞춰 카메라를 열고 닫으며, 켜져 있는 동안 최신 프레임 1장만 보관한다.
@@ -2610,7 +2640,9 @@ class AttendanceApp:
                 else:
                     time.sleep(0.005)
         except (EOFError, OSError):
-            pass  # 프로그램 종료로 인식 프로세스가 닫힌 경우
+            # 프로그램 종료로 닫힌 경우가 아니면, 모델을 받지 못했거나 인식 프로세스가 죽은 것이다
+            if self.is_running:
+                self.ai_failed = True
 
     def _update_blink_state(self, blink_score):
         """
@@ -2911,6 +2943,16 @@ class AttendanceApp:
             return
         now = datetime.now()
         self.lbl_clock.config(text=now.strftime("%Y-%m-%d  %H:%M:%S"))
+        if self.ai_failed:
+            ai_text, ai_color = ("⚠ 얼굴 인식을 시작하지 못했습니다.\n"
+                                 "인터넷 연결을 확인하고 프로그램을 다시 실행하세요. (logs\\app.log 참고)"), "#EF4444"
+        elif not self.ai_ready:
+            ai_text, ai_color = ("얼굴 인식을 준비하고 있습니다...\n"
+                                 "처음 실행하면 모델(약 300MB)을 받느라 몇 분 걸립니다."), "#F59E0B"
+        else:
+            ai_text, ai_color = "", "#F59E0B"
+        if self.lbl_ai_status.cget("text") != ai_text:
+            self.lbl_ai_status.config(text=ai_text, fg=ai_color)
         # 프로그램을 며칠씩 켜두어도 3개월 지난 사진이 지워지도록 날짜가 바뀌면 한 번 정리한다
         if now.date() != self._photo_cleanup_date:
             self._photo_cleanup_date = now.date()
@@ -2918,11 +2960,17 @@ class AttendanceApp:
         self.window.after(1000, self._update_clock)
 
     def _check_operating_hours(self):
-        """무인 운영(--kiosk)이면 00:00~06:00에 종료한다. 관리자가 작업 중이면 로그아웃할 때까지 기다린다."""
+        """
+        무인 운영(--kiosk)이면 운영 시간(06:00~24:00)이 끝나는 자정에 종료한다.
+        관리자가 작업 중이면 로그아웃할 때까지 기다리고, 새벽에 직접 켠 경우(점검용)는 끄지 않는다.
+        """
         if not self.is_running:
             return
         now = datetime.now()
-        if now.strftime("%H:%M:%S") < VALID_ATTENDANCE_START and self.mode != "admin":
+        in_hours = now.strftime("%H:%M:%S") >= VALID_ATTENDANCE_START
+        if in_hours:
+            self._seen_operating_hours = True
+        elif getattr(self, "_seen_operating_hours", False) and self.mode != "admin":
             print(f"[출석] {now:%Y-%m-%d %H:%M:%S} 운영 시간이 끝나 종료합니다.")
             self.on_close()
             return
@@ -3076,6 +3124,49 @@ class AttendanceApp:
 # ==========================================
 # 4. 앱 실행
 # ==========================================
+def run_selftest(app, seconds=10):
+    """
+    --selftest : 설치 후 자가진단. 카메라 테스트 화면을 seconds초 동안 켜서
+    카메라·얼굴 인식·사진 차단 검사가 도는지 logs/selftest.txt 에 적고 종료한다.
+    """
+    stats = {"frames_start": None, "faces": 0, "blink": False, "liveness": False}
+    original = app._update_blink_state
+
+    def spy(score):  # 인식 결과가 올 때마다 불린다
+        if app.cached_faces:
+            stats["faces"] += 1
+        original(score)
+    app._update_blink_state = spy
+
+    def start():
+        if not app.ai_ready and not app.ai_failed and time.time() - started < 600:
+            app.window.after(500, start)  # 처음이면 모델을 받는 중이다 (최대 10분 대기)
+            return
+        app.start_camera_test()
+        stats["frames_start"] = app.frame_seq
+        app.window.after(seconds * 1000, finish)
+
+    def finish():
+        frames = app.frame_seq - (stats["frames_start"] or 0)
+        lines = [
+            f"자가진단 {datetime.now():%Y-%m-%d %H:%M:%S}",
+            f"얼굴 인식 모델 : {'정상' if app.ai_ready else '실패'}",
+            f"카메라         : {'정상' if frames > 0 and not app.camera_error else '실패'} ({frames / seconds:.0f} fps)",
+            f"얼굴 감지      : {stats['faces']}회 (카메라 앞에 사람이 있어야 잡힙니다)",
+            f"눈 깜빡임 검사 : {'사용' if app.liveness_enabled else '확인 안 됨 (얼굴이 없었거나 모델 없음)'}",
+            f"위조판별       : {'사용' if app.antispoof_enabled else '확인 안 됨 (얼굴이 없었거나 애드온 없음)'}",
+        ]
+        ok = app.ai_ready and frames > 0 and not app.camera_error
+        lines.append("결과           : " + ("정상" if ok else "문제 있음"))
+        os.makedirs(os.path.join(APP_DIR, "logs"), exist_ok=True)
+        with open(os.path.join(APP_DIR, "logs", "selftest.txt"), "w", encoding="utf-8") as f:
+            f.write("\n".join(lines) + "\n")
+        app.on_close()
+
+    started = time.time()
+    app.window.after(500, start)
+
+
 if __name__ == "__main__":
     multiprocessing.freeze_support()  # exe로 패키징해도 인식 프로세스가 앱을 다시 띄우지 않게
 
@@ -3086,7 +3177,22 @@ if __name__ == "__main__":
         print(f"[출석] 모델 준비 완료 (깜빡임 검사: {'사용' if ready else '사용 안 함'})")
         sys.exit(0)
 
+    # --scheduled : 작업 스케줄러/시작프로그램이 띄운 경우. 00:00~06:00이면 켜지 않고, 자정에 스스로 종료한다.
+    scheduled = "--scheduled" in sys.argv
+    if scheduled and datetime.now().strftime("%H:%M:%S") < VALID_ATTENDANCE_START:
+        sys.exit(0)
+
+    # 카메라는 한 프로그램만 쓸 수 있으므로 이미 켜져 있으면 하나 더 띄우지 않는다
+    if not acquire_single_instance():
+        if not scheduled:
+            _root = tk.Tk()
+            _root.withdraw()
+            messagebox.showinfo("창의공간 출석체크", "출석체크 프로그램이 이미 실행 중입니다.")
+        sys.exit(0)
+
     root = tk.Tk()
-    app = AttendanceApp(root, kiosk="--kiosk" in sys.argv)
+    app = AttendanceApp(root, kiosk=scheduled or "--kiosk" in sys.argv)
     root.protocol("WM_DELETE_WINDOW", app.on_close)
+    if "--selftest" in sys.argv:
+        run_selftest(app)
     root.mainloop()

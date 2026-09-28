@@ -18,6 +18,15 @@ from PIL import Image, ImageDraw, ImageFont, ImageTk
 # 프로그램 파일이 있는 폴더 — 어느 폴더에서 실행해도 같은 DB/모델을 쓰도록 기준으로 삼는다
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
 
+# 콘솔 없이(pythonw, 작업 스케줄러) 실행하면 sys.stdout/stderr가 None이라 모델 로딩 중
+# 진행 표시 등이 출력하다 죽을 수 있다. 이때는 logs/app.log 파일로 남긴다.
+# (얼굴 인식 프로세스도 이 파일을 다시 불러오므로 거기에도 똑같이 적용된다)
+if sys.stdout is None or sys.stderr is None:
+    os.makedirs(os.path.join(APP_DIR, "logs"), exist_ok=True)
+    _log_file = open(os.path.join(APP_DIR, "logs", "app.log"), "a", encoding="utf-8", buffering=1)
+    sys.stdout = sys.stdout or _log_file
+    sys.stderr = sys.stderr or _log_file
+
 DB_PATH = os.path.join(APP_DIR, "faces.db")
 THRESHOLD = 0.50
 
@@ -144,8 +153,12 @@ def create_blink_detector():
     try:
         from mediapipe.tasks.python import BaseOptions
         from mediapipe.tasks.python import vision
+        # 경로 대신 파일 내용을 넘긴다 — MediaPipe는 한글이 들어간 경로(예: '새 폴더')를 열지 못해서
+        # 경로로 넘기면 깜빡임 검사가 소리 없이 꺼진다
+        with open(LIVENESS_MODEL_PATH, "rb") as f:
+            model_bytes = f.read()
         return vision.FaceLandmarker.create_from_options(vision.FaceLandmarkerOptions(
-            base_options=BaseOptions(model_asset_path=LIVENESS_MODEL_PATH),
+            base_options=BaseOptions(model_asset_buffer=model_bytes),
             running_mode=vision.RunningMode.VIDEO,
             output_face_blendshapes=True,   # eyeBlinkLeft / eyeBlinkRight 값을 쓰기 위해
             num_faces=1,
@@ -190,8 +203,8 @@ def detect_blink_score(landmarker, frame, timestamp_ms):
     return max(scores.get("eyeBlinkLeft", 0.0), scores.get("eyeBlinkRight", 0.0))
 
 
-def face_inference_process(conn, threads):
-    import onnxruntime
+def create_face_app():
+    """InsightFace 얼굴 인식기를 만든다 (처음이면 모델을 ~/.insightface 로 내려받는다)."""
     from insightface.app import FaceAnalysis
 
     # addons=["liveness"] — InsightFace 공식 위조판별(사진/화면 판별) 애드온.
@@ -215,6 +228,13 @@ def face_inference_process(conn, threads):
             providers=["CPUExecutionProvider"]
         )
     app.prepare(ctx_id=0, det_size=(256, 256))
+    return app
+
+
+def face_inference_process(conn, threads):
+    import onnxruntime
+
+    app = create_face_app()
 
     # onnxruntime은 기본으로 CPU 코어를 전부 써서 카메라/화면 쪽이 밀린다.
     # insightface는 세션 옵션을 넘겨받지 않으므로 같은 모델 파일로 세션만 다시 만든다.
@@ -2268,8 +2288,11 @@ class AdminDashboardFrame(tk.Frame):
 # 3. 메인 어플리케이션
 # ==========================================
 class AttendanceApp:
-    def __init__(self, window):
+    def __init__(self, window, kiosk=False):
         self.window = window
+        # 무인 운영(--kiosk): 00:00~06:00(출퇴근 미인정 시간)이 되면 스스로 종료한다.
+        # 06:00 재시작은 윈도우 작업 스케줄러가 맡는다 (windows/install.bat 참고).
+        self.kiosk = kiosk
         self.window.title("창의공간 얼굴인식 출석체크 시스템")
         self.window.configure(bg="#F1F5F9") # 깔끔한 slate 연회색 배경
 
@@ -2410,6 +2433,9 @@ class AttendanceApp:
         self.show_idle()
         self.update_video()
         self._update_clock()
+        if self.kiosk:
+            # 창이 다 뜬 뒤부터 확인한다 (만드는 도중에 닫으면 오류가 난다)
+            self.window.after(1000, self._check_operating_hours)
 
     def create_widgets(self):
         # 상단 헤더 배너 (Modern Dark Slate) — 좌측 타이틀 / 우측 [관리자] [카메라 테스트] 작은 버튼 + 시계
@@ -2891,6 +2917,17 @@ class AttendanceApp:
             threading.Thread(target=cleanup_old_photos, daemon=True).start()
         self.window.after(1000, self._update_clock)
 
+    def _check_operating_hours(self):
+        """무인 운영(--kiosk)이면 00:00~06:00에 종료한다. 관리자가 작업 중이면 로그아웃할 때까지 기다린다."""
+        if not self.is_running:
+            return
+        now = datetime.now()
+        if now.strftime("%H:%M:%S") < VALID_ATTENDANCE_START and self.mode != "admin":
+            print(f"[출석] {now:%Y-%m-%d %H:%M:%S} 운영 시간이 끝나 종료합니다.")
+            self.on_close()
+            return
+        self.window.after(1000, self._check_operating_hours)
+
     def _rebuild_embedding_matrix(self):
         # 정규화된 임베딩을 미리 쌓아두면 프레임마다 norm을 다시 계산하지 않고
         # 행렬곱 한 번으로 전체 등록자와의 유사도를 구할 수 있다.
@@ -3041,7 +3078,15 @@ class AttendanceApp:
 # ==========================================
 if __name__ == "__main__":
     multiprocessing.freeze_support()  # exe로 패키징해도 인식 프로세스가 앱을 다시 띄우지 않게
+
+    # --prepare : 얼굴 인식·위조판별·깜빡임 모델을 미리 내려받고 끝낸다 (설치할 때 한 번)
+    if "--prepare" in sys.argv:
+        create_face_app()
+        ready = create_blink_detector() is not None
+        print(f"[출석] 모델 준비 완료 (깜빡임 검사: {'사용' if ready else '사용 안 함'})")
+        sys.exit(0)
+
     root = tk.Tk()
-    app = AttendanceApp(root)
+    app = AttendanceApp(root, kiosk="--kiosk" in sys.argv)
     root.protocol("WM_DELETE_WINDOW", app.on_close)
     root.mainloop()

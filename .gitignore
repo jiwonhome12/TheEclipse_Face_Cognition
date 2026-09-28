@@ -119,6 +119,9 @@ faces.db-journal
 *.part
 # 출퇴근 순간 얼굴 사진 (관리자 전용, 90일 뒤 자동 삭제)
 attendance_photos/
+# 무인 운영 로그 · 설치할 때 기록한 파이썬 경로 (PC마다 다름)
+logs/
+windows/python_path.txt
 
 # IDE / 에디터 설정
 .vs/

@@ -5,12 +5,13 @@ import time
 import sqlite3
 import json
 import os
+import shutil
 import sys
 import multiprocessing
 import calendar
 from datetime import date, datetime, timedelta
 import tkinter as tk
-from tkinter import ttk, messagebox, simpledialog, filedialog
+from tkinter import ttk, messagebox, filedialog
 from tkinter import font as tkfont
 from PIL import Image, ImageDraw, ImageFont, ImageTk
 
@@ -35,6 +36,19 @@ BLINK_VALID_SECONDS = 10    # 출퇴근을 누르기 전 이 시간 안에 깜�
 # 모델은 처음 실행할 때 ~/.insightface/addons/liveness.onnx 로 자동 다운로드된다.
 LIVENESS_THRESHOLD = 0.8
 LIVENESS_VALID_SECONDS = 3  # 출퇴근을 누르기 전 이 시간 안에 '실제 사람' 판정이 있어야 한다
+
+# 출근/퇴근 버튼을 누른 뒤의 흐름
+SESSION_TIMEOUT = 30           # 출근/퇴근을 누른 뒤 이 시간(초) 안에 얼굴이 확인되지 않으면 메인 화면으로 돌아간다
+TEST_TIMEOUT = 60              # 카메라 테스트 화면도 켜둔 채 잊지 않도록 이 시간이 지나면 메인 화면으로 돌아간다
+RECOGNIZE_HOLD_SECONDS = 0.6   # 같은 사람으로 이 시간 동안 계속 인식돼야 기록한다 (지나가는 사람 오인식 방지)
+RESULT_POPUP_SECONDS = 3       # "OOO 학생 출근 되었습니다" 안내창이 떠 있는 시간
+STATS_POPUP_SECONDS = 20       # [출석 조회] 창이 자동으로 닫히는 시간 (뒤 사람이 보지 않도록)
+
+# 출퇴근할 때 찍힌 얼굴 사진 — 관리자 화면에서만 볼 수 있고, 보관 기간이 지나면 자동으로 지운다
+PHOTO_DIR = os.path.join(APP_DIR, "attendance_photos")
+PHOTO_WIDTH = 320              # 640x480 원본을 320x240으로 줄여서 저장 (장당 약 10~15KB)
+PHOTO_JPEG_QUALITY = 70
+PHOTO_RETENTION_DAYS = 90      # 3개월
 RIGHT_PANEL_WIDTH = 620  # 우측 UI 패널 폭 — 1600x900 기준 값이고, 실제로는 px()로 화면 배율을 곱해서 쓴다
 
 # 기준 창 크기(창공시스템과 동일). 모니터가 이보다 작으면 UI_SCALE만큼 전체를 줄여서 띄운다.
@@ -553,6 +567,80 @@ def export_attendance_json():
         # 내보내기 실패는 치명적이지 않다 — 다음 출결 처리 때 다시 시도한다
         pass
 
+
+# ==========================================
+# 0-2. 출퇴근 사진 저장 / 자동 삭제
+# ==========================================
+# 사진은 PHOTO_DIR/날짜/시각_학번_IN|OUT.jpg 로 저장하고, DB에는 PHOTO_DIR 기준 상대 경로만 남긴다.
+# (폴더를 통째로 옮기거나 구글 드라이브 동기화 폴더로 바꿔도 경로가 깨지지 않게)
+def photo_abs_path(rel_path):
+    return os.path.join(PHOTO_DIR, *rel_path.split("/"))
+
+
+def save_attendance_photo(frame, user_id, log_type, when):
+    """출퇴근 순간의 카메라 화면을 작게 줄여 JPEG로 저장한다. 저장한 상대 경로, 실패하면 None."""
+    if frame is None:
+        return None
+    try:
+        h, w = frame.shape[:2]
+        if w > PHOTO_WIDTH:
+            frame = cv2.resize(frame, (PHOTO_WIDTH, int(h * PHOTO_WIDTH / w)), interpolation=cv2.INTER_AREA)
+        ok, buf = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, PHOTO_JPEG_QUALITY])
+        if not ok:
+            return None
+        safe_id = "".join(c if c.isalnum() else "_" for c in str(user_id))
+        kind = "IN" if log_type == "CHECK_IN" else "OUT"
+        rel_path = f"{when:%Y-%m-%d}/{when:%H%M%S}_{safe_id}_{kind}.jpg"
+        abs_path = photo_abs_path(rel_path)
+        os.makedirs(os.path.dirname(abs_path), exist_ok=True)
+        # cv2.imwrite는 윈도우에서 한글이 들어간 경로(예: '새 폴더')에 저장하지 못해서 바이트로 직접 쓴다
+        with open(abs_path, "wb") as f:
+            f.write(buf.tobytes())
+        return rel_path
+    except Exception as e:
+        # 사진 저장 실패로 출퇴근 기록까지 막지는 않는다
+        print(f"[출석] 출퇴근 사진을 저장하지 못했습니다 ({e})")
+        return None
+
+
+def delete_photo_files(rel_paths):
+    for rel_path in rel_paths:
+        if not rel_path:
+            continue
+        try:
+            os.remove(photo_abs_path(rel_path))
+        except OSError:
+            pass
+
+
+def cleanup_old_photos(today=None):
+    """
+    PHOTO_RETENTION_DAYS(3개월)가 지난 날짜 폴더를 통째로 지우고, DB의 사진 경로도 비운다.
+    출퇴근 기록(시간) 자체는 그대로 남는다. 지운 폴더 수를 돌려준다.
+    """
+    cutoff = (today or date.today()) - timedelta(days=PHOTO_RETENTION_DAYS)
+    removed = 0
+    if os.path.isdir(PHOTO_DIR):
+        for name in os.listdir(PHOTO_DIR):
+            try:
+                folder_date = datetime.strptime(name, "%Y-%m-%d").date()
+            except ValueError:
+                continue  # 날짜 폴더가 아닌 것은 건드리지 않는다
+            if folder_date < cutoff:
+                shutil.rmtree(os.path.join(PHOTO_DIR, name), ignore_errors=True)
+                removed += 1
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        conn.execute(
+            "UPDATE attendance_logs SET photo_path = NULL WHERE photo_path IS NOT NULL AND log_date < ?",
+            (cutoff.isoformat(),),
+        )
+        conn.commit()
+        conn.close()
+    except sqlite3.Error:
+        pass
+    return removed
+
 # ==========================================
 # 1. DB 초기화 및 관련 함수
 # ==========================================
@@ -605,6 +693,11 @@ def init_db():
             FOREIGN KEY (user_id) REFERENCES users(user_id)
         )
     """)
+    # 출퇴근 순간 사진 (PHOTO_DIR 기준 상대 경로, 보관 기간이 지나면 NULL)
+    try:
+        cursor.execute("ALTER TABLE attendance_logs ADD COLUMN photo_path TEXT")
+    except sqlite3.OperationalError:
+        pass
 
     # 예전 기본 관리자 계정(dongseo@mail.com / admin1234)이 남아 있으면 새 계정으로 바꾼다
     cursor.execute("SELECT id FROM users WHERE user_id = '1234'")
@@ -710,6 +803,7 @@ def get_weekly_attendance_stats(user_id):
     attended_days, total_seconds = summarize_attendance(logs)
 
     return {
+        "sessions": pair_attendance_sessions(logs),  # 이번주 출근→퇴근 목록 ([출석 조회] 창에 표시)
         "days": attended_days,
         "seconds": total_seconds,
         "missing_days": max(0, WEEKLY_REQUIRED_DAYS - attended_days),
@@ -761,9 +855,14 @@ def get_today_attendance_status(user_id):
         "working_seconds": working_seconds,
     }
 
-def log_attendance(user_id, name, log_type):
-    today_date = datetime.now().strftime("%Y-%m-%d")
-    now_time = datetime.now().strftime("%H:%M:%S")
+def log_attendance(user_id, name, log_type, frame=None):
+    """
+    출근/퇴근을 기록한다. frame을 넘기면 그 순간 카메라 화면을 작게 줄여 사진으로 남긴다.
+    반환: (성공 여부, 안내 문구) — 성공이면 기록 시각(+ 미인정 안내), 실패면 그 이유.
+    """
+    now = datetime.now()
+    today_date = now.strftime("%Y-%m-%d")
+    now_time = now.strftime("%H:%M:%S")
 
     # 하루에 여러 번 출퇴근할 수 있지만, 퇴근을 안 한 상태에서 또 출근을 누르는 것은 막는다
     if log_type == 'CHECK_IN' and is_valid_attendance_time(now_time):
@@ -772,23 +871,24 @@ def log_attendance(user_id, name, log_type):
             return False, (f"이미 출근 완료 되었습니다. ({working_since} 출근)\n"
                            "퇴근을 먼저 찍은 뒤에 다시 출근할 수 있습니다.")
 
+    photo_path = save_attendance_photo(frame, user_id, log_type, now)
+
     conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
 
     # 하루에 출근/퇴근을 여러 번 할 수 있어서 누를 때마다 새 기록으로 남긴다
     cursor.execute("""
-        INSERT INTO attendance_logs (user_id, name, log_type, log_date, log_time)
-        VALUES (?, ?, ?, ?, ?)
-    """, (user_id, name, log_type, today_date, now_time))
+        INSERT INTO attendance_logs (user_id, name, log_type, log_date, log_time, photo_path)
+        VALUES (?, ?, ?, ?, ?, ?)
+    """, (user_id, name, log_type, today_date, now_time, photo_path))
     conn.commit()
     conn.close()
     export_attendance_json()  # 창공시스템이 읽는 출결 파일도 즉시 갱신
 
-    type_str = "출근" if log_type == 'CHECK_IN' else "퇴근"
     if not is_valid_attendance_time(now_time):
-        return True, (f"{now_time} {type_str}이 기록되었습니다.\n"
+        return True, (f"기록 시각 {now_time}\n"
                       "단, 00:00~06:00 사이 출퇴근은 출석 일수와 시간에 인정되지 않습니다.")
-    return True, f"{now_time} {type_str}이 확인 되었습니다."
+    return True, f"기록 시각 {now_time}"
 
 
 # ==========================================
@@ -934,106 +1034,199 @@ LOG_FILTER_MODES = [
 ]
 LOG_SUMMARY_MODES = {"recent7_sum", "week_days", "week_hours"}
 
-class AdminLoginFrame(tk.Frame):
-    """ 두번째 이미지: 기본 화면 (관리자 로그인 기능) """
-    def __init__(self, parent):
-        super().__init__(parent.right_container, bg="white", bd=1, relief=tk.SOLID)
-        self.parent = parent
+ACTION_LABELS = {"CHECK_IN": "출근", "CHECK_OUT": "퇴근"}
+ACTION_COLORS = {"CHECK_IN": ("#10B981", "#059669"), "CHECK_OUT": ("#3B82F6", "#2563EB")}
 
-        # 외부 마진 시뮬레이션용 프레임
-        card_inner = tk.Frame(self, bg="white")
-        card_inner.pack(padx=px(60), pady=px(60), fill=tk.BOTH, expand=True)
 
-        title_row = tk.Frame(card_inner, bg="white")
-        title_row.pack(fill=tk.X, pady=(0, px(30)))
+def center_on(window, popup, rel_y=0.4):
+    """popup을 window 가운데(세로는 rel_y 위치)에 띄운다."""
+    popup.update_idletasks()
+    x = window.winfo_rootx() + (window.winfo_width() - popup.winfo_reqwidth()) // 2
+    y = window.winfo_rooty() + int((window.winfo_height() - popup.winfo_reqheight()) * rel_y)
+    popup.geometry(f"+{max(0, x)}+{max(0, y)}")
 
-        lbl_title = tk.Label(title_row, text="관리자 로그인", font=(UI_FONT, 20, "bold"), bg="white", fg="#1E293B")
-        lbl_title.pack(side=tk.LEFT)
 
-        # 학생 화면에서 [관리자]를 눌러 여기로 온 경우 되돌아갈 수 있게 (기본 화면에선 눌러도 그대로라 무해함)
-        btn_cancel = Button(
-            title_row, text="✕ 취소", bg="white", fg="#94A3B8", bd=0,
-            activebackground="white", activeforeground="#475569",
-            font=(UI_FONT, 10, "bold"), cursor="hand2", command=self.parent.reset_to_default_view
-        )
-        btn_cancel.pack(side=tk.RIGHT)
+class AdminLoginDialog(tk.Toplevel):
+    """상단 [관리자] 버튼을 누르면 뜨는 로그인 창."""
 
-        # 이메일 입력 그룹 (기입된 글자 없도록 비워둠)
-        lbl_email = tk.Label(card_inner, text="이메일 주소", font=(UI_FONT, 10, "bold"), bg="white", fg="#64748B")
-        lbl_email.pack(anchor=tk.W, pady=(0, 4))
-        self.ent_email = ttk.Entry(card_inner, font=(UI_FONT, 12))
-        self.ent_email.pack(fill=tk.X, ipady=4, pady=(0, 15))
+    def __init__(self, app):
+        super().__init__(app.window)
+        self.app = app
+        self.title("관리자 로그인")
+        self.configure(bg="white")
+        self.resizable(False, False)
+        self.transient(app.window)
 
-        # 비밀번호 입력 그룹 (기입된 글자 없도록 비워둠)
-        lbl_pwd = tk.Label(card_inner, text="비밀번호", font=(UI_FONT, 10, "bold"), bg="white", fg="#64748B")
-        lbl_pwd.pack(anchor=tk.W, pady=(0, 4))
-        self.ent_pwd = ttk.Entry(card_inner, font=(UI_FONT, 12), show="*")
-        self.ent_pwd.pack(fill=tk.X, ipady=4, pady=(0, 25))
+        body = tk.Frame(self, bg="white")
+        body.pack(padx=px(40), pady=px(32))
 
-        # 로그인 버튼 해상도(크기) 강화
-        btn_login = Button(
-            card_inner, text="로그인 (Log In)", bg="#3B82F6", fg="white", bd=0,
+        tk.Label(body, text="관리자 로그인", font=(UI_FONT, 18, "bold"), bg="white", fg="#1E293B") \
+            .pack(anchor=tk.W, pady=(0, px(20)))
+
+        tk.Label(body, text="아이디", font=(UI_FONT, 10, "bold"), bg="white", fg="#64748B").pack(anchor=tk.W)
+        self.ent_id = ttk.Entry(body, font=(UI_FONT, 12), width=28)
+        self.ent_id.pack(fill=tk.X, ipady=4, pady=(px(4), px(14)))
+
+        tk.Label(body, text="비밀번호", font=(UI_FONT, 10, "bold"), bg="white", fg="#64748B").pack(anchor=tk.W)
+        self.ent_pwd = ttk.Entry(body, font=(UI_FONT, 12), width=28, show="*")
+        self.ent_pwd.pack(fill=tk.X, ipady=4, pady=(px(4), px(22)))
+
+        btn_row = tk.Frame(body, bg="white")
+        btn_row.pack(fill=tk.X)
+        Button(
+            btn_row, text="취소", bg="#E2E8F0", fg="#334155", bd=0,
+            activebackground="#CBD5E1", activeforeground="#1E293B",
+            font=(UI_FONT, 12, "bold"), height=2, cursor="hand2", command=self.destroy
+        ).pack(side=tk.LEFT, expand=True, fill=tk.X, padx=(0, px(6)))
+        Button(
+            btn_row, text="로그인", bg="#3B82F6", fg="white", bd=0,
             activebackground="#2563EB", activeforeground="white",
-            font=(UI_FONT, 13, "bold"), height=2, cursor="hand2", command=self.try_login
-        )
-        btn_login.pack(fill=tk.X, pady=5)
+            font=(UI_FONT, 12, "bold"), height=2, cursor="hand2", command=self.try_login
+        ).pack(side=tk.LEFT, expand=True, fill=tk.X, padx=(px(6), 0))
+
+        self.bind("<Return>", lambda e: self.try_login())
+        self.bind("<Escape>", lambda e: self.destroy())
+
+        center_on(app.window, self, rel_y=0.33)
+        self.ent_id.focus_set()
+        # 창이 화면에 뜬 다음에 잡아야 한다 (뜨기 전에 grab_set하면 'window not viewable' 오류가 날 수 있다)
+        self.after(50, self._grab)
+
+    def _grab(self):
+        try:
+            if self.winfo_exists():
+                self.grab_set()
+        except tk.TclError:
+            pass
 
     def try_login(self):
-        email = self.ent_email.get().strip()
+        user_id = self.ent_id.get().strip()
         pwd = self.ent_pwd.get().strip()
 
-        if not (email and pwd):
-            messagebox.showwarning("주의", "이메일과 비밀번호를 입력해주세요.")
+        if not (user_id and pwd):
+            messagebox.showwarning("주의", "아이디와 비밀번호를 입력해주세요.", parent=self)
             return
 
         conn = sqlite3.connect(DB_PATH)
         cursor = conn.cursor()
-        cursor.execute("SELECT name, role FROM users WHERE user_id = ? AND password = ?", (email, pwd))
+        cursor.execute("SELECT role FROM users WHERE user_id = ? AND password = ?", (user_id, pwd))
         row = cursor.fetchone()
         conn.close()
 
-        if row:
-            name, role = row
-            if role == "admin":
-                self.parent.set_admin_logged_in(True, email)
-                self.ent_email.delete(0, tk.END)
-                self.ent_pwd.delete(0, tk.END)
-            else:
-                messagebox.showerror("오류", "관리자 권한이 없습니다.")
-        else:
-            messagebox.showerror("오류", "로그인 정보가 틀렸습니다.")
+        if not row:
+            messagebox.showerror("오류", "로그인 정보가 틀렸습니다.", parent=self)
+            return
+        if row[0] != "admin":
+            messagebox.showerror("오류", "관리자 권한이 없습니다.", parent=self)
+            return
+
+        # 창을 먼저 닫고 나서 화면을 바꾼다 (닫힌 입력칸을 건드리지 않도록)
+        self.destroy()
+        self.app.set_admin_logged_in(True, user_id)
 
 
-class StudentInfoFrame(tk.Frame):
-    """ 첫번째 이미지: 학생 얼굴 인식 시 뜨는 화면 (비밀번호 추가 검증 단계 포함) """
-    def __init__(self, parent, student_info):
-        super().__init__(parent.right_container, bg="white")
-        self.parent = parent
+class SessionCard(tk.Frame):
+    """카메라가 켜진 동안 오른쪽에 뜨는 안내 카드의 공통 틀 (제목 · 안내 · 상태 · 남은 시간 · 닫기 버튼)."""
+
+    def __init__(self, app, title, color, subtitle, lines, close_text, master=None):
+        super().__init__(master or app.right_container, bg="white", bd=1, relief=tk.SOLID)
+
+        inner = tk.Frame(self, bg="white")
+        inner.pack(padx=px(40), pady=px(44), fill=tk.BOTH, expand=True)
+
+        tk.Label(inner, text=title, font=(UI_FONT, 30, "bold"), bg="white", fg=color).pack(anchor=tk.W)
+        tk.Label(inner, text=subtitle, font=(UI_FONT, 17, "bold"),
+                 bg="white", fg="#1E293B").pack(anchor=tk.W, pady=(px(6), px(28)))
+
+        for line in lines:
+            tk.Label(inner, text=line, font=(UI_FONT, 12), bg="white", fg="#334155",
+                     justify=tk.LEFT, wraplength=px(RIGHT_PANEL_WIDTH - 140)).pack(anchor=tk.W, pady=px(4))
+
+        self.lbl_status = tk.Label(inner, text="", font=(UI_FONT, 13, "bold"), bg="#F1F5F9", fg="#475569",
+                                   padx=px(14), pady=px(12), anchor=tk.W, justify=tk.LEFT,
+                                   wraplength=px(RIGHT_PANEL_WIDTH - 140))
+        self.lbl_status.pack(fill=tk.X, pady=(px(28), 0))
+
+        Button(
+            inner, text=close_text, bg="#E2E8F0", fg="#334155", bd=0,
+            activebackground="#CBD5E1", activeforeground="#1E293B",
+            font=(UI_FONT, 12, "bold"), height=2, cursor="hand2", command=app.show_idle
+        ).pack(side=tk.BOTTOM, fill=tk.X)
+        self.lbl_remaining = tk.Label(inner, text="", font=(UI_FONT, 10), bg="white", fg="#94A3B8")
+        self.lbl_remaining.pack(side=tk.BOTTOM, anchor=tk.E, pady=(0, px(6)))
+
+    def set_status(self, text, fg="#475569"):
+        # 화면이 매 프레임 불러서 글자가 바뀔 때만 다시 그린다
+        if self.lbl_status.cget("text") != text or self.lbl_status.cget("fg") != fg:
+            self.lbl_status.config(text=text, fg=fg)
+
+    def set_remaining(self, seconds):
+        text = f"{seconds}초 뒤 처음 화면으로 돌아갑니다"
+        if self.lbl_remaining.cget("text") != text:
+            self.lbl_remaining.config(text=text)
+
+
+class AttendanceWaitingFrame(SessionCard):
+    """
+    출근/퇴근 버튼을 누른 뒤 얼굴이 확인될 때까지 보여주는 안내 카드.
+    카메라 영상은 화면에 띄우지 않는다 — 카메라는 뒤에서 얼굴 확인에만 쓴다.
+    """
+
+    def __init__(self, app, log_type, master):
+        action = ACTION_LABELS[log_type]
+        super().__init__(
+            app, action, ACTION_COLORS[log_type][0], "얼굴을 확인하고 있습니다",
+            ("① 카메라를 정면으로 바라봐 주세요",
+             "② 눈을 한 번 깜빡여 주세요",
+             f"③ 확인되면 자동으로 {action} 처리됩니다"),
+            "취소", master=master,
+        )
+        self.set_status("얼굴을 찾는 중...")
+
+
+class LookupWaitingFrame(SessionCard):
+    """상단 [출석 조회]를 누른 뒤 얼굴을 확인하는 카드. 확인된 본인에게만 출석 시간을 보여준다 (기록은 하지 않는다)."""
+
+    def __init__(self, app, master):
+        super().__init__(
+            app, "출석 조회", "#1E293B", "얼굴을 확인하고 있습니다",
+            ("① 카메라를 정면으로 바라봐 주세요",
+             "② 눈을 한 번 깜빡여 주세요",
+             "③ 확인되면 본인의 출석 시간이 표시됩니다 (출퇴근은 기록되지 않습니다)"),
+            "취소", master=master,
+        )
+        self.set_status("얼굴을 찾는 중...")
+
+
+class CameraTestFrame(SessionCard):
+    """상단 [카메라 테스트]를 누르면 뜨는 카드 — 출퇴근 기록 없이 카메라와 얼굴 인식만 확인한다."""
+
+    def __init__(self, app):
+        super().__init__(
+            app, "카메라 테스트", "#475569", "출퇴근은 기록되지 않습니다",
+            ("• 카메라 화면이 나오는지 확인하세요",
+             "• 얼굴에 초록 상자 + 이름이 뜨면 정상 인식입니다",
+             "• 빨간 상자(UNKNOWN)면 인식이 안 되는 상태입니다.\n"
+             "   조명을 밝게 하고 정면을 바라보거나, 관리자에게 재등록을 요청하세요"),
+            "닫기",
+        )
+        self.set_status("카메라를 켜는 중...")
+
+
+class AttendanceStatsFrame(tk.Frame):
+    """학생 본인의 이번주 출석 현황 (출근 일수 · 시간 · 부족분 · 오늘 출근 · 패널티 · 이번주 출퇴근 기록)."""
+
+    def __init__(self, master, student_info):
+        super().__init__(master, bg="#F8FAFC", bd=1, relief=tk.SOLID)
         self.student_info = student_info
 
-        # 학생 얼굴이 인식된 상태에서도 관리자가 바로 로그인 화면으로 넘어갈 수 있는 버튼
-        top_bar = tk.Frame(self, bg="white")
-        top_bar.pack(fill=tk.X, padx=px(15), pady=(px(10), 0))
-
-        btn_admin = Button(
-            top_bar, text="🔑 관리자", bg="#1E293B", fg="white", bd=0,
-            activebackground="#334155", activeforeground="white",
-            font=(UI_FONT, 9, "bold"), padx=10, pady=4, cursor="hand2",
-            command=self.parent.show_admin_login
-        )
-        btn_admin.pack(side=tk.RIGHT)
-
-        # 이번주 출석 현황 박스 (Clean Card Style)
-        stats_frame = tk.Frame(self, bg="#F8FAFC", bd=1, relief=tk.SOLID)
-        stats_frame.pack(fill=tk.X, padx=px(15), pady=px(10))
-
-        lbl_stats_title = tk.Label(stats_frame, text="이번주 출석 현황", font=(UI_FONT, 13, "bold"), bg="#F8FAFC", fg="#1E293B")
-        lbl_stats_title.pack(anchor=tk.W, padx=px(15), pady=(px(12), px(8)))
+        tk.Label(self, text="이번주 출석 현황", font=(UI_FONT, 13, "bold"), bg="#F8FAFC", fg="#1E293B") \
+            .pack(anchor=tk.W, padx=px(15), pady=(px(12), px(8)))
 
         weekly = get_weekly_attendance_stats(student_info["user_id"])
 
         # 항목 / 이번주 기록 / 부족분을 표처럼 맞춰서 보여준다. 기준에 못 미친 부족분은 빨간색으로 강조.
-        stats_grid = tk.Frame(stats_frame, bg="#F8FAFC")
+        stats_grid = tk.Frame(self, bg="#F8FAFC")
         stats_grid.pack(anchor=tk.W, fill=tk.X, padx=px(25), pady=px(2))
 
         def add_stat_row(row, title, value_text, missing_text):
@@ -1074,61 +1267,42 @@ class StudentInfoFrame(tk.Frame):
         # 3진 아웃제 기준 패널티 색상 경고 표기
         penalty_val = student_info['penalty']
         penalty_color = "#EF4444" if penalty_val >= 2 else "#F59E0B" if penalty_val == 1 else "#10B981"
-        
-        penalty_container = tk.Frame(stats_frame, bg="#F8FAFC")
+
+        penalty_container = tk.Frame(self, bg="#F8FAFC")
         penalty_container.pack(anchor=tk.W, padx=px(25), pady=(px(2), px(4)))
-        
-        lbl_penalty_bullet = tk.Label(penalty_container, text="• 패널티 현황 : ", font=(UI_FONT, 11), bg="#F8FAFC", fg="#334155")
-        lbl_penalty_bullet.pack(side=tk.LEFT)
-        
-        lbl_penalty_value = tk.Label(penalty_container, text=f"{penalty_val}개", font=(UI_FONT, 11, "bold"), bg="#F8FAFC", fg=penalty_color)
-        lbl_penalty_value.pack(side=tk.LEFT)
+        tk.Label(penalty_container, text="• 패널티 현황 : ", font=(UI_FONT, 11), bg="#F8FAFC", fg="#334155") \
+            .pack(side=tk.LEFT)
+        tk.Label(penalty_container, text=f"{penalty_val}개", font=(UI_FONT, 11, "bold"), bg="#F8FAFC", fg=penalty_color) \
+            .pack(side=tk.LEFT)
 
-        lbl_rule = tk.Label(
-            stats_frame, text="06:00~24:00 출퇴근만 인정 · 퇴근을 찍어야 시간 인정",
+        # 이번주 출퇴근 기록 (날짜 · 출근 · 퇴근 · 인정 시간)
+        tk.Label(self, text="이번주 출퇴근 기록", font=(UI_FONT, 11, "bold"), bg="#F8FAFC", fg="#1E293B") \
+            .pack(anchor=tk.W, padx=px(15), pady=(px(10), px(4)))
+        table = tk.Frame(self, bg="#F8FAFC")
+        table.pack(anchor=tk.W, fill=tk.X, padx=px(25))
+        for col, heading in enumerate(("날짜", "출근", "퇴근", "인정 시간")):
+            tk.Label(table, text=heading, font=(UI_FONT, 9, "bold"), bg="#F8FAFC", fg="#94A3B8") \
+                .grid(row=0, column=col, sticky=tk.W, padx=(0, px(18)))
+        sessions = weekly["sessions"]
+        if not sessions:
+            tk.Label(table, text="이번주 기록이 없습니다", font=(UI_FONT, 10), bg="#F8FAFC", fg="#94A3B8") \
+                .grid(row=1, column=0, columnspan=4, sticky=tk.W, pady=px(2))
+        for row, s in enumerate(sessions, start=1):
+            try:
+                day_text = format_date_ko(datetime.strptime(s["date"], "%Y-%m-%d").date())[5:]
+            except (TypeError, ValueError):
+                day_text = s["date"]
+            seconds = session_seconds(s)
+            cells = (day_text, s["check_in"] or "-", s["check_out"] or "-",
+                     format_duration(seconds) if seconds else "-")
+            for col, value in enumerate(cells):
+                tk.Label(table, text=value, font=(UI_FONT, 10), bg="#F8FAFC", fg="#0F172A") \
+                    .grid(row=row, column=col, sticky=tk.W, padx=(0, px(18)), pady=px(1))
+
+        tk.Label(
+            self, text="06:00~24:00 출퇴근만 인정 · 퇴근을 찍어야 시간 인정",
             font=(UI_FONT, 9), bg="#F8FAFC", fg="#94A3B8"
-        )
-        lbl_rule.pack(anchor=tk.W, padx=px(25), pady=(0, px(12)))
-
-        # 학생 프로필 정보 박스
-        profile_frame = tk.Frame(self, bg="white", bd=1, relief=tk.SOLID)
-        profile_frame.pack(fill=tk.BOTH, expand=True, padx=px(15), pady=px(10))
-
-        info_inner = tk.Frame(profile_frame, bg="white")
-        info_inner.pack(padx=px(20), pady=px(20), fill=tk.BOTH, expand=True)
-
-        lbl_name_tag = tk.Label(info_inner, text="이름", font=(UI_FONT, 9, "bold"), bg="white", fg="#94A3B8")
-        lbl_name_tag.pack(anchor=tk.W, pady=(0, 1))
-        lbl_name = tk.Label(info_inner, text=student_info["name"], font=(UI_FONT, 14, "bold"), bg="white", fg="#0F172A")
-        lbl_name.pack(anchor=tk.W, pady=(0, 12))
-
-        lbl_id_tag = tk.Label(info_inner, text="학번", font=(UI_FONT, 9, "bold"), bg="white", fg="#94A3B8")
-        lbl_id_tag.pack(anchor=tk.W, pady=(0, 1))
-        lbl_id = tk.Label(info_inner, text=student_info['user_id'], font=(UI_FONT, 14, "bold"), bg="white", fg="#0F172A")
-        lbl_id.pack(anchor=tk.W, pady=(0, 12))
-
-        lbl_major_tag = tk.Label(info_inner, text="전공 학과", font=(UI_FONT, 9, "bold"), bg="white", fg="#94A3B8")
-        lbl_major_tag.pack(anchor=tk.W, pady=(0, 1))
-        lbl_major = tk.Label(info_inner, text=student_info['major'], font=(UI_FONT, 13, "bold"), bg="white", fg="#0F172A")
-        lbl_major.pack(anchor=tk.W, pady=(0, 15))
-
-        # 출근 / 퇴근 버튼 구성 (크기 강화)
-        btn_frame = tk.Frame(info_inner, bg="white")
-        btn_frame.pack(fill=tk.X, pady=5)
-
-        btn_in = Button(
-            btn_frame, text="출 근 (IN)", bg="#10B981", fg="white", font=(UI_FONT, 13, "bold"), 
-            bd=0, activebackground="#059669", activeforeground="white", height=2, cursor="hand2",
-            command=lambda: self.handle_action("CHECK_IN")
-        )
-        btn_in.pack(side=tk.LEFT, expand=True, fill=tk.X, padx=5)
-
-        btn_out = Button(
-            btn_frame, text="퇴 근 (OUT)", bg="#3B82F6", fg="white", font=(UI_FONT, 13, "bold"), 
-            bd=0, activebackground="#2563EB", activeforeground="white", height=2, cursor="hand2",
-            command=lambda: self.handle_action("CHECK_OUT")
-        )
-        btn_out.pack(side=tk.RIGHT, expand=True, fill=tk.X, padx=5)
+        ).pack(anchor=tk.W, padx=px(25), pady=(px(10), px(12)))
 
     def _refresh_today_status(self):
         """오늘 출근 시간을 다시 계산해서 표시한다. 출근 중이면 1초 뒤에 다시 갱신한다."""
@@ -1150,49 +1324,141 @@ class StudentInfoFrame(tk.Frame):
             self.lbl_today_note.config(text="오늘 출근 기록 없음", fg="#94A3B8")
 
     def _stop_today_timer(self, event=None):
-        """카드가 사라지면(다른 화면으로 전환되면) 갱신 예약을 취소한다."""
+        """창이 닫히면 갱신 예약을 취소한다."""
         if event is not None and event.widget is not self:
             return
         if self._today_after_id is not None:
             self.after_cancel(self._today_after_id)
             self._today_after_id = None
 
-    def handle_action(self, log_type):
-        # 1차 차단 — InsightFace 위조판별 애드온 (사진/화면 판별)
-        if not self.parent.passes_antispoof():
-            messagebox.showerror("본인 확인 실패", self.parent.liveness_reject_message())
-            return
 
-        # 2차 차단 — 눈 깜빡임 (애드온을 못 쓰는 환경에서도 사진은 막히도록)
-        if not self.parent.has_recent_blink():
-            messagebox.showerror(
-                "본인 확인 실패",
-                "사람 얼굴이 아닌 것으로 보입니다.\n"
-                "카메라를 바라보고 눈을 한 번 깜빡인 뒤 다시 눌러주세요.",
-            )
-            return
+class ResultPopup(tk.Toplevel):
+    """
+    출퇴근 처리 결과 안내창 — "OOO 학생 출근 되었습니다." RESULT_POPUP_SECONDS 뒤 저절로 닫힌다.
+    [출석 조회]를 누른 사람에게만 본인 출석 시간을 보여준다 (메인 화면에는 누구의 시간도 띄우지 않는다).
+    """
 
-        # 도용 방지 비밀번호 확인 다이얼로그 띄우기
-        pwd_input = simpledialog.askstring("도용 방지", "본인 확인을 위해 비밀번호를 입력해주세요:", show="*", parent=self)
-        if pwd_input is None:
-            return # 취소 시 동작 안 함
-            
-        # DB에서 저장된 본인 비밀번호와 매칭 검사
-        conn = sqlite3.connect(DB_PATH)
-        cursor = conn.cursor()
-        cursor.execute("SELECT password FROM users WHERE user_id = ?", (self.student_info["user_id"],))
-        row = cursor.fetchone()
-        conn.close()
+    def __init__(self, app, student_info, log_type, success, detail):
+        super().__init__(app.window)
+        self.app = app
+        self.student_info = student_info
+        self.overrideredirect(True)  # 제목 표시줄 없이 알림처럼
+        self.attributes("-topmost", True)
+        color = ACTION_COLORS[log_type][0] if success else "#F59E0B"
+        self.configure(bg=color)  # 바깥 테두리 색
 
-        if row and row[0] == pwd_input:
-            success, msg = log_attendance(self.student_info["user_id"], self.student_info["name"], log_type)
-            if success:
-                messagebox.showinfo("확인 완료", msg)
-            else:
-                messagebox.showwarning("주의", msg)
-            self.parent.reset_to_default_view()
+        body = tk.Frame(self, bg="white")
+        body.pack(padx=px(3), pady=px(3))
+        inner = tk.Frame(body, bg="white")
+        inner.pack(padx=px(48), pady=px(34))
+
+        action = ACTION_LABELS[log_type]
+        name = student_info["name"]
+        if success:
+            icon, headline = "✅", f"{name} 학생 {action} 되었습니다."
         else:
-            messagebox.showerror("오류", "비밀번호가 일치하지 않습니다. 도용 방지를 위해 요청을 중단합니다.")
+            icon, headline = "⚠️", f"{name} 학생 {action} 처리가 되지 않았습니다."
+
+        tk.Label(inner, text=icon, font=(UI_FONT, 34), bg="white", fg=color).pack()
+        tk.Label(inner, text=headline, font=(UI_FONT, 20, "bold"), bg="white", fg="#0F172A") \
+            .pack(pady=(px(8), px(8)))
+        tk.Label(inner, text=detail, font=(UI_FONT, 12), bg="white", fg="#475569", justify=tk.CENTER) \
+            .pack()
+
+        btn_row = tk.Frame(inner, bg="white")
+        btn_row.pack(pady=(px(24), 0))
+        Button(
+            btn_row, text="📋 출석 조회", bg="#1E293B", fg="white", bd=0,
+            activebackground="#334155", activeforeground="white",
+            font=(UI_FONT, 12, "bold"), padx=px(22), pady=px(8), cursor="hand2", command=self.open_stats
+        ).pack(side=tk.LEFT, padx=px(6))
+        self.btn_close = Button(
+            btn_row, text="", bg="#E2E8F0", fg="#334155", bd=0,
+            activebackground="#CBD5E1", activeforeground="#1E293B",
+            font=(UI_FONT, 12, "bold"), padx=px(22), pady=px(8), cursor="hand2", command=self.destroy
+        )
+        self.btn_close.pack(side=tk.LEFT, padx=px(6))
+
+        center_on(app.window, self)
+        self._remaining = RESULT_POPUP_SECONDS
+        self._tick()
+
+    def _tick(self):
+        if not self.winfo_exists():
+            return
+        if self._remaining <= 0:
+            self.destroy()
+            return
+        self.btn_close.config(text=f"닫기 ({self._remaining})")
+        self._remaining -= 1
+        self.after(1000, self._tick)
+
+    def open_stats(self):
+        student_info = self.student_info
+        self.destroy()
+        self.app.open_popup(StatsDialog(self.app, student_info))
+
+
+class StatsDialog(tk.Toplevel):
+    """[출석 조회]를 누르면 뜨는 본인 출석 현황 창. STATS_POPUP_SECONDS 뒤 저절로 닫힌다."""
+
+    def __init__(self, app, student_info):
+        super().__init__(app.window)
+        self.title("출석 조회")
+        self.configure(bg="white")
+        self.resizable(False, False)
+        self.transient(app.window)
+        self.attributes("-topmost", True)
+
+        body = tk.Frame(self, bg="white")
+        body.pack(padx=px(24), pady=px(20))
+
+        tk.Label(body, text=f"{student_info['name']} 님의 출석 조회", font=(UI_FONT, 16, "bold"),
+                 bg="white", fg="#0F172A").pack(anchor=tk.W)
+        tk.Label(body, text=f"학번 {student_info['user_id']} · {student_info['major']}", font=(UI_FONT, 10),
+                 bg="white", fg="#64748B").pack(anchor=tk.W, pady=(px(2), px(12)))
+
+        AttendanceStatsFrame(body, student_info).pack(fill=tk.X)
+
+        self.btn_close = Button(
+            body, text="", bg="#E2E8F0", fg="#334155", bd=0,
+            activebackground="#CBD5E1", activeforeground="#1E293B",
+            font=(UI_FONT, 12, "bold"), height=2, cursor="hand2", command=self.destroy
+        )
+        self.btn_close.pack(fill=tk.X, pady=(px(14), 0))
+        self.bind("<Escape>", lambda e: self.destroy())
+
+        center_on(app.window, self, rel_y=0.3)
+        self._remaining = STATS_POPUP_SECONDS
+        self._tick()
+
+    def _tick(self):
+        if not self.winfo_exists():
+            return
+        if self._remaining <= 0:
+            self.destroy()
+            return
+        self.btn_close.config(text=f"닫기 ({self._remaining}초 뒤 자동으로 닫힙니다)")
+        self._remaining -= 1
+        self.after(1000, self._tick)
+
+
+class PhotoViewer(tk.Toplevel):
+    """관리자 출결로그에서 출퇴근 사진을 크게 보여주는 창."""
+
+    def __init__(self, master, image, caption):
+        super().__init__(master)
+        self.title("출퇴근 사진")
+        self.configure(bg="#0F172A")
+        self.resizable(False, False)
+
+        # 저장본은 320x240으로 작아서 보기 편하게 두 배로 키운다
+        shown = image.resize((image.width * 2, image.height * 2), Image.LANCZOS)
+        self._photo = ImageTk.PhotoImage(shown)  # 참조를 들고 있어야 그림이 사라지지 않는다
+        tk.Label(self, image=self._photo, bg="#0F172A").pack(padx=px(12), pady=(px(12), px(6)))
+        tk.Label(self, text=caption, font=(UI_FONT, 11, "bold"), bg="#0F172A", fg="white") \
+            .pack(pady=(0, px(12)))
+        self.bind("<Escape>", lambda e: self.destroy())
 
 
 class AdminDashboardFrame(tk.Frame):
@@ -1600,10 +1866,23 @@ class AdminDashboardFrame(tk.Frame):
         self.tree_logs.tag_configure("invalid", foreground="#94A3B8")
         self.tree_logs.pack(fill=tk.BOTH, expand=True)
         scroll.config(command=self.tree_logs.yview)
+        self.tree_logs.bind("<Double-1>", lambda e: self.show_log_photo())
+        self._log_photos = {}  # 트리뷰 행 id → (사진 상대 경로, 설명)
 
-        self.lbl_log_result = tk.Label(self.tab_logs, text="", anchor=tk.W, bg="#F8FAFC", fg="#334155",
+        result_bar = tk.Frame(self.tab_logs, bg="#F8FAFC")
+        result_bar.pack(fill=tk.X, padx=5, pady=(0, 5))
+        self.btn_log_photo = Button(
+            result_bar, text="📷 사진 보기", bg="#1E293B", fg="white", bd=0,
+            activebackground="#334155", activeforeground="white",
+            font=(UI_FONT, 9, "bold"), padx=px(10), pady=px(3), cursor="hand2", command=self.show_log_photo
+        )
+        self.btn_log_photo.pack(side=tk.RIGHT, padx=px(8))
+        self.lbl_log_result = tk.Label(result_bar, text="", anchor=tk.W, bg="#F8FAFC", fg="#334155",
                                        font=(UI_FONT, 10, "bold"), padx=px(10), pady=px(6))
-        self.lbl_log_result.pack(fill=tk.X, padx=5, pady=(0, 5))
+        self.lbl_log_result.pack(side=tk.LEFT, fill=tk.X, expand=True)
+        tk.Label(self.tab_logs, text=f"📷 행을 더블클릭하면 출퇴근 사진을 봅니다 · 사진은 {PHOTO_RETENTION_DAYS}일 뒤 자동 삭제",
+                 anchor=tk.W, bg="white", fg="#94A3B8", font=(UI_FONT, 9)) \
+            .pack(fill=tk.X, padx=px(10), pady=(0, 5))
 
         self.on_log_mode_changed()
 
@@ -1694,6 +1973,7 @@ class AdminDashboardFrame(tk.Frame):
     def _set_log_columns(self, columns):
         """columns: (키, 제목, 폭, 정렬) 목록으로 트리뷰 컬럼을 바꾸고 기존 행을 비운다."""
         self.tree_logs.delete(*self.tree_logs.get_children())
+        self._log_photos = {}
         self.tree_logs["columns"] = [key for key, _, _, _ in columns]
         self.tree_logs["displaycolumns"] = "#all"
         for key, heading, width, anchor in columns:
@@ -1707,10 +1987,11 @@ class AdminDashboardFrame(tk.Frame):
             ("log_type", "구분", 95, tk.CENTER),
             ("log_date", "날짜", 125, tk.CENTER),
             ("log_time", "시간", 85, tk.CENTER),
+            ("photo", "사진", 45, tk.CENTER),
         ])
 
         query = """
-            SELECT user_id, name, log_type, log_date, log_time
+            SELECT user_id, name, log_type, log_date, log_time, photo_path
             FROM attendance_logs
             WHERE log_date BETWEEN ? AND ?
         """
@@ -1726,7 +2007,7 @@ class AdminDashboardFrame(tk.Frame):
         rows = cursor.fetchall()
         conn.close()
 
-        for user_id, name, log_type, log_date, log_time in rows:
+        for user_id, name, log_type, log_date, log_time, photo_path in rows:
             valid = is_valid_attendance_time(log_time)
             type_text = "출근" if log_type == "CHECK_IN" else "퇴근"
             if not valid:
@@ -1735,13 +2016,40 @@ class AdminDashboardFrame(tk.Frame):
                 date_text = format_date_ko(datetime.strptime(log_date, "%Y-%m-%d").date())
             except (TypeError, ValueError):
                 date_text = log_date
-            self.tree_logs.insert("", tk.END, values=(user_id, name, type_text, date_text, log_time),
-                                  tags=() if valid else ("invalid",))
+            item = self.tree_logs.insert(
+                "", tk.END, values=(user_id, name, type_text, date_text, log_time, "📷" if photo_path else ""),
+                tags=() if valid else ("invalid",)
+            )
+            if photo_path:
+                self._log_photos[item] = (photo_path, f"{name} ({user_id}) · {date_text} {log_time} {type_text}")
 
         check_in = sum(1 for r in rows if r[2] == "CHECK_IN")
         self.lbl_log_result.config(
             text=f"총 {len(rows)}건 (출근 {check_in} · 퇴근 {len(rows) - check_in}) · 학생 {len({r[0] for r in rows})}명"
         )
+
+    def show_log_photo(self):
+        """출결로그에서 고른 행의 출퇴근 사진을 연다. (관리자 화면에서만 볼 수 있다)"""
+        selected = self.tree_logs.selection()
+        if not selected:
+            messagebox.showinfo("사진 보기", "사진을 볼 출결 기록을 목록에서 선택하세요.")
+            return
+        entry = self._log_photos.get(selected[0])
+        if not entry:
+            messagebox.showinfo(
+                "사진 없음",
+                "이 기록에는 사진이 없습니다.\n"
+                f"(사진 기능 도입 전 기록이거나, {PHOTO_RETENTION_DAYS}일 보관 기간이 지나 삭제되었습니다)",
+            )
+            return
+        rel_path, caption = entry
+        try:
+            with Image.open(photo_abs_path(rel_path)) as img:
+                image = img.convert("RGB")
+        except (OSError, ValueError):
+            messagebox.showinfo("사진 없음", "사진 파일을 찾을 수 없습니다. 이미 삭제되었을 수 있습니다.")
+            return
+        PhotoViewer(self, image, caption)
 
     def _show_log_summary(self, mode, start, end, keyword):
         self._set_log_columns([
@@ -1841,11 +2149,15 @@ class AdminDashboardFrame(tk.Frame):
             
             # SQLite 타입 유연성을 고려하여 문자열 및 정수형 모두 삭제 쿼리 반영
             alt_id = int(student_id) if str(student_id).isdigit() else student_id
+            cursor.execute("SELECT photo_path FROM attendance_logs WHERE user_id = ? OR user_id = ?",
+                           (str(student_id), alt_id))
+            photo_paths = [row[0] for row in cursor.fetchall()]
             cursor.execute("DELETE FROM users WHERE user_id = ? OR user_id = ?", (str(student_id), alt_id))
             cursor.execute("DELETE FROM attendance_logs WHERE user_id = ? OR user_id = ?", (str(student_id), alt_id))
-            
+
             conn.commit()
             conn.close()
+            delete_photo_files(photo_paths)  # 출결 기록과 함께 그 학생의 출퇴근 사진도 지운다
 
             messagebox.showinfo("성공", "선택 정보가 삭제되었습니다.")
             self.load_students()
@@ -1860,6 +2172,7 @@ class AdminDashboardFrame(tk.Frame):
             cursor.execute("DELETE FROM attendance_logs")
             conn.commit()
             conn.close()
+            shutil.rmtree(PHOTO_DIR, ignore_errors=True)  # 출퇴근 사진도 전부 삭제
 
             messagebox.showinfo("성공", "전체 데이터가 삭제되었습니다.")
             self.load_students()
@@ -2035,14 +2348,24 @@ class AttendanceApp:
         self.roster_lookup = {}
         self.apply_roster(load_roster())
 
-        # 상태 제어 필드
+        # 화면 상태
+        #   idle       : 메인 화면. 카메라/얼굴 인식 꺼짐, 출근·퇴근 버튼만 보인다
+        #   attendance : 출근/퇴근을 누른 뒤. 카메라가 켜지고 얼굴이 확인되면 자동으로 기록한다
+        #   test       : 상단 [카메라 테스트]. 카메라와 인식 결과만 보여주고 기록은 하지 않는다
+        #   admin      : 관리자 로그인 후. 학생 등록에 쓰도록 카메라가 켜져 있다
+        self.mode = "idle"
         self.admin_logged_in = False
         self.admin_email = ""
-        self.current_view_state = None  # "login", "student", "admin"
-        self.current_student_id = None
-        self.last_face_time = 0.0
-        self.admin_login_requested = False  # 학생 화면에서 [관리자]를 눌러 로그인 화면으로 넘어온 상태
-        self.camera_on = True
+        self.pending_action = None      # attendance 모드에서 누른 버튼 ("CHECK_IN" / "CHECK_OUT")
+        self.session_started = 0.0      # attendance/test 모드에 들어간 시각 (시간 초과 계산용)
+        self._session_card = None       # 오른쪽 안내 카드 (AttendanceWaitingFrame / CameraTestFrame)
+        self._candidate_id = None       # 지금 인식되고 있는 학생 — RECOGNIZE_HOLD_SECONDS 동안 유지돼야 기록
+        self._candidate_since = 0.0
+        self._popups = []               # 결과 안내창 / 출석 조회 창 — 다음 사람이 버튼을 누르면 닫는다
+        self.ai_ready = False           # 얼굴 인식 모델 로딩이 끝났는지
+        self.camera_on = False          # 캡처 스레드가 이 값에 맞춰 카메라 장치를 열고 닫는다
+        self.camera_error = False
+        self.camera_generation = 0      # 카메라를 켜고 끌 때마다 1씩 증가 — 이전 세션의 늦은 인식 결과를 버리는 데 쓴다
 
         # 사진/영상 판별용 깜빡임 상태 (인식 프로세스가 깜빡임 값을 보내주면 켜진다)
         self.liveness_enabled = False
@@ -2058,23 +2381,13 @@ class AttendanceApp:
         # UI 레이아웃 구성
         self.create_widgets()
 
-        # 기본 화면으로 전환
-        self.reset_to_default_view()
-
-        # 웹캠 기동 — OS별로 맞는 백엔드를 고른다 (open_camera 참고)
+        # macOS 카메라 권한은 앱을 켤 때 미리 받아둔다 (처음 한 번만 허용 창이 뜬다).
+        # 카메라 장치 자체는 출근/퇴근 버튼을 눌렀을 때 캡처 스레드가 연다.
         ensure_camera_permission()
-        self.cap = open_camera(0)
-        if not self.cap.isOpened():
-            msg = "카메라를 열 수 없습니다. 다른 프로그램이 카메라를 쓰고 있는지 확인하세요."
-            if IS_MAC:
-                msg += ("\n\nmacOS: 시스템 설정 > 개인정보 보호 및 보안 > 카메라 에서 "
-                        "이 프로그램을 실행한 앱(터미널, VS Code 등)의 카메라 접근을 허용한 뒤 "
-                        "그 앱을 완전히 종료했다가 다시 실행하세요.")
-            messagebox.showerror("카메라 오류", msg)
-        self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
-        self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
-        self.cap.set(cv2.CAP_PROP_FPS, 30)
-        self.cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)  # 밀린 옛 프레임 대신 항상 최신 프레임
+
+        # 3개월 지난 출퇴근 사진 정리 — 시작할 때 한 번, 이후 날짜가 바뀔 때마다 (_update_clock)
+        self._photo_cleanup_date = date.today()
+        threading.Thread(target=cleanup_old_photos, daemon=True).start()
 
         self.latest_frame = None
         self.frame_seq = 0          # 캡처 스레드가 새 프레임을 받을 때마다 1씩 증가
@@ -2094,11 +2407,12 @@ class AttendanceApp:
         self.ai_thread = threading.Thread(target=self.ai_worker, daemon=True)
         self.ai_thread.start()
 
+        self.show_idle()
         self.update_video()
         self._update_clock()
 
     def create_widgets(self):
-        # 상단 헤더 배너 (Modern Dark Slate) — 좌측 타이틀 / 우측 실시간 시계
+        # 상단 헤더 배너 (Modern Dark Slate) — 좌측 타이틀 / 우측 [관리자] [카메라 테스트] 작은 버튼 + 시계
         title_frame = tk.Frame(self.window, bg="#0F172A", height=px(84))
         title_frame.pack(fill=tk.X, side=tk.TOP)
         title_frame.pack_propagate(False)
@@ -2117,16 +2431,40 @@ class AttendanceApp:
                                 bg="#0F172A", fg="#64748B", font=(UI_FONT, 9))
         lbl_subtitle.pack(anchor=tk.W)
 
+        header_btn = dict(bg="#1E293B", fg="#CBD5E1", bd=0, activebackground="#334155", activeforeground="white",
+                          font=(UI_FONT, 9, "bold"), padx=px(12), pady=px(4), cursor="hand2")
+        # 로그인 후에는 [관리자 로그아웃]으로 바뀐다
+        self.btn_admin_header = Button(header_inner, text="🔑 관리자", command=self.on_admin_header_button,
+                                       **header_btn)
+        self.btn_admin_header.pack(side=tk.RIGHT, padx=(px(8), 0))
+        # 관리자 화면에서는 숨기는 버튼 묶음
+        self.header_tools = tk.Frame(header_inner, bg="#0F172A")
+        self.header_tools.pack(side=tk.RIGHT, padx=(px(20), 0))
+        # 얼굴 인식이 안 될 때 카메라가 제대로 나오는지 확인하는 용도 (기록은 하지 않는다)
+        self.btn_camera_test = Button(self.header_tools, text="📷 카메라 테스트", command=self.start_camera_test,
+                                      **header_btn)
+        self.btn_camera_test.pack(side=tk.LEFT)
+        # 얼굴로 본인 확인 후 이번주 출근 시간을 본다 (출퇴근 기록 없이)
+        self.btn_lookup = Button(self.header_tools, text="📋 출석 조회", command=self.start_lookup, **header_btn)
+        self.btn_lookup.pack(side=tk.LEFT, padx=(px(8), 0))
+
         self.lbl_clock = tk.Label(header_inner, text="", bg="#0F172A", fg="#CBD5E1",
                                   font=(UI_FONT, 15, "bold"))
         self.lbl_clock.pack(side=tk.RIGHT)
 
-        # 메인 콘텐츠 컨테이너
+        # 메인 콘텐츠 컨테이너 — 메인 화면(idle_view)과 카메라 화면(session_view)을 번갈아 보여준다
         content_frame = tk.Frame(self.window, bg="#F1F5F9")
         content_frame.pack(fill=tk.BOTH, expand=True, padx=px(20), pady=px(20))
+        self._build_idle_view(content_frame)
+
+        # 출근/퇴근 확인 중 화면 — 카메라 영상 없이 안내 카드만 가운데에 보여준다
+        self.checking_view = tk.Frame(content_frame, bg="#F1F5F9")
+
+        # 카메라 화면 — 카메라 테스트 / 관리자 화면에서만 영상이 보인다
+        self.session_view = tk.Frame(content_frame, bg="#F1F5F9")
 
         # 좌측: 카메라 패널 (상단 상태바 + 영상 영역)
-        self.camera_panel = tk.Frame(content_frame, bg="#0F172A",
+        self.camera_panel = tk.Frame(self.session_view, bg="#0F172A",
                                      highlightthickness=1, highlightbackground="#CBD5E1")
         self.camera_panel.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
 
@@ -2134,7 +2472,7 @@ class AttendanceApp:
         cam_bar.pack(fill=tk.X, side=tk.TOP)
         cam_bar.pack_propagate(False)
 
-        self.lbl_cam_status = tk.Label(cam_bar, text="● LIVE", bg="#1E293B", fg="#10B981",
+        self.lbl_cam_status = tk.Label(cam_bar, text="● OFF", bg="#1E293B", fg="#EF4444",
                                        font=(UI_FONT, 11, "bold"))
         self.lbl_cam_status.pack(side=tk.LEFT, padx=px(16))
 
@@ -2142,14 +2480,6 @@ class AttendanceApp:
         self.lbl_liveness = tk.Label(cam_bar, text="", bg="#1E293B", fg="#94A3B8",
                                      font=(UI_FONT, 10, "bold"))
         self.lbl_liveness.pack(side=tk.LEFT)
-
-        self.btn_camera_toggle = Button(
-            cam_bar, text="📷 화면 끄기", bg="#334155", fg="white", bd=0,
-            activebackground="#475569", activeforeground="white",
-            font=(UI_FONT, 10, "bold"), padx=px(16), pady=px(5), cursor="hand2",
-            command=self.toggle_camera
-        )
-        self.btn_camera_toggle.pack(side=tk.RIGHT, padx=px(14))
 
         # 영상 영역 — 이미지 크기 계산은 상태바를 뺀 이 영역 기준으로 한다
         self.video_area = tk.Frame(self.camera_panel, bg="#0F172A")
@@ -2159,37 +2489,95 @@ class AttendanceApp:
         self.video_label.pack(padx=px(10), pady=px(10), fill=tk.BOTH, expand=True)
 
         # 우측: 가변 상태 패널 컨테이너
-        self.right_container = tk.Frame(content_frame, width=px(RIGHT_PANEL_WIDTH), bg="#F1F5F9")
+        self.right_container = tk.Frame(self.session_view, width=px(RIGHT_PANEL_WIDTH), bg="#F1F5F9")
         self.right_container.pack(side=tk.RIGHT, fill=tk.Y, expand=False, padx=(px(20), 0))
         self.right_container.pack_propagate(False)
 
+    def _build_idle_view(self, parent):
+        """메인 화면 — 카메라 없이 출근/퇴근 버튼만 크게 보여준다."""
+        self.idle_view = tk.Frame(parent, bg="#F1F5F9")
+
+        card = tk.Frame(self.idle_view, bg="white", highlightthickness=1, highlightbackground="#E2E8F0")
+        card.place(relx=0.5, rely=0.45, anchor=tk.CENTER)
+
+        inner = tk.Frame(card, bg="white")
+        inner.pack(padx=px(70), pady=px(56))
+
+        tk.Label(inner, text="출퇴근 체크", font=(UI_FONT, 26, "bold"), bg="white", fg="#0F172A").pack()
+        tk.Label(inner, text="버튼을 누르고 카메라를 바라보면 자동으로 기록됩니다",
+                 font=(UI_FONT, 12), bg="white", fg="#64748B").pack(pady=(px(8), px(36)))
+
+        btn_row = tk.Frame(inner, bg="white")
+        btn_row.pack()
+        for log_type, text in (("CHECK_IN", "출 근"), ("CHECK_OUT", "퇴 근")):
+            color, active = ACTION_COLORS[log_type]
+            Button(
+                btn_row, text=text, bg=color, fg="white", bd=0,
+                activebackground=active, activeforeground="white",
+                font=(UI_FONT, 28, "bold"), width=8, height=3, cursor="hand2",
+                command=lambda t=log_type: self.start_attendance(t)
+            ).pack(side=tk.LEFT, padx=px(14))
+
+        tk.Label(inner, text="06:00~24:00 출퇴근만 인정 · 퇴근을 찍어야 시간 인정",
+                 font=(UI_FONT, 10), bg="white", fg="#94A3B8").pack(pady=(px(32), 0))
+
     def capture_worker(self):
-        """카메라에서 프레임을 계속 받아 최신 1장만 보관한다 (화면을 꺼둔 동안은 읽지 않는다)."""
+        """
+        camera_on에 맞춰 카메라를 열고 닫으며, 켜져 있는 동안 최신 프레임 1장만 보관한다.
+        카메라는 이 스레드에서만 다룬다 (읽는 도중에 다른 스레드가 release하면 드라이버가 멈출 수 있다).
+        꺼져 있을 때는 장치를 완전히 닫아서 카메라 불도 꺼진다.
+        """
+        cap = None
         while self.is_running:
             if not self.camera_on:
+                if cap is not None:
+                    cap.release()
+                    cap = None
                 time.sleep(0.05)
                 continue
-            ret, frame = self.cap.read()
+
+            if cap is None:
+                cap = open_camera(0)  # OS별로 맞는 백엔드를 고른다 (open_camera 참고)
+                if not cap.isOpened():
+                    cap.release()
+                    cap = None
+                    self.camera_error = True
+                    time.sleep(1.0)  # 다른 프로그램이 놓아줄 수도 있으니 켜져 있는 동안 1초마다 다시 시도
+                    continue
+                self.camera_error = False
+                cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
+                cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
+                cap.set(cv2.CAP_PROP_FPS, 30)
+                cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)  # 밀린 옛 프레임 대신 항상 최신 프레임
+
+            ret, frame = cap.read()
             if not ret:
                 time.sleep(0.01)
                 continue
-            self.latest_frame = cv2.flip(frame, 1)
-            self.frame_seq += 1
+            if self.camera_on:  # 읽는 사이에 꺼졌다면 버린다
+                self.latest_frame = cv2.flip(frame, 1)
+                self.frame_seq += 1
+
+        if cap is not None:
+            cap.release()
 
     def ai_worker(self):
         """최신 프레임을 인식 프로세스로 보내고 결과를 받아온다 (한 번에 1장씩만 보내서 밀리지 않게)."""
         try:
             self.face_conn.recv()  # 인식 프로세스의 모델 로딩 완료 신호
+            self.ai_ready = True
             last_seq = -1
             while self.is_running:
                 frame = self.latest_frame
                 seq = self.frame_seq
+                generation = self.camera_generation
                 # 같은 프레임을 두 번 분석하지 않는다 (관리자 탭에서도 학생 등록용 스캔은 계속 유지)
                 if self.camera_on and frame is not None and seq != last_seq:
                     last_seq = seq
                     self.face_conn.send(frame)
                     results, blink_score, liveness = self.face_conn.recv()
-                    if self.camera_on:  # 분석 중에 화면을 껐다면 예전 얼굴을 남기지 않는다
+                    # 분석하는 사이에 카메라를 껐다 켰다면(다음 사람) 예전 얼굴 결과는 버린다
+                    if self.camera_on and generation == self.camera_generation:
                         self.cached_faces = [DetectedFace(bbox, emb) for bbox, emb in results]
                         self._update_blink_state(blink_score)
                         self._update_liveness_state(liveness)
@@ -2265,6 +2653,24 @@ class AttendanceApp:
         if self.camera_on and frame is not None and seq != self._rendered_seq:
             self._rendered_seq = seq
             self._render_frame(frame)
+        elif self.camera_on and self.camera_error and self._photo is None:
+            msg = "📷\n\n카메라를 열 수 없습니다\n다른 프로그램이 카메라를 쓰고 있는지 확인하세요"
+            if IS_MAC:
+                msg += "\n\n시스템 설정 > 개인정보 보호 및 보안 > 카메라에서\n실행한 앱(터미널 등)을 허용한 뒤 다시 실행하세요"
+            if self.video_label.cget("text") != msg:
+                self.video_label.config(image="", text=msg, fg="#F87171", font=(UI_FONT, 13, "bold"))
+                self.lbl_cam_status.config(text="● 카메라 오류", fg="#EF4444")
+            if self._session_card is not None:
+                self._session_card.set_status("카메라를 열 수 없습니다. 관리자에게 알려주세요.", "#EF4444")
+
+        # 출근/퇴근·카메라 테스트 중 시간이 지나면 메인 화면으로 (카메라도 꺼진다)
+        if self.mode in ("attendance", "lookup", "test") and self._session_card is not None:
+            limit = TEST_TIMEOUT if self.mode == "test" else SESSION_TIMEOUT
+            remaining = limit - (time.time() - self.session_started)
+            if remaining <= 0:
+                self.show_idle()
+            else:
+                self._session_card.set_remaining(int(remaining) + 1)
 
         if self.is_running:
             self.window.after(5, self.update_video)
@@ -2310,10 +2716,10 @@ class AttendanceApp:
                     # 이름은 창공시스템 명단(roster.json)을 우선 쓴다 — 새로고침하면 바로 반영된다.
                     display_name = self._resolve_display_name(user)
                     label = f"{display_name} ({sim:.2f})"
-                    color_bgr = (16, 185, 129)  # Neon Green (#10B981)
+                    color_bgr = (129, 185, 16)  # Neon Green (#10B981) — cv2는 BGR 순서
                 else:
                     label = "UNKNOWN"
-                    color_bgr = (239, 68, 68)  # Rose Red (#EF4444)
+                    color_bgr = (68, 68, 239)  # Rose Red (#EF4444) — cv2는 BGR 순서
 
                 cv2.rectangle(display, (x1, y1), (x2, y2), color_bgr, 2)
                 color_rgb = (color_bgr[2], color_bgr[1], color_bgr[0])
@@ -2323,23 +2729,14 @@ class AttendanceApp:
                     best_sim = sim
                     best_user = user
 
-        # 관리자가 로그인하지 않았고, 학생 화면에서 [관리자]를 눌러 로그인 중도 아닐 때만
-        # 얼굴 인식 결과로 화면을 자동으로 바꾼다 (안 그러면 로그인 화면이 자꾸 밀려난다)
-        if not self.admin_logged_in and not self.admin_login_requested:
-            if best_sim >= THRESHOLD and best_user:
-                self.last_face_time = time.time()
-                # 새로운 사용자를 보았을 때 화면 카드 교환
-                if self.current_student_id != best_user["user_id"]:
-                    self.current_student_id = best_user["user_id"]
-                    # 표시용 이름은 최신 창공시스템 명단을 우선한다
-                    shown_user = dict(best_user)
-                    shown_user["name"] = self._resolve_display_name(best_user)
-                    self.show_student_view(shown_user)
-            else:
-                # 감지된 얼굴이 없으면 4초 카운트 다운 후 기본 관리자 로그인 카드로 복귀
-                if self.current_view_state == "student":
-                    if time.time() - self.last_face_time > 4.0:
-                        self.reset_to_default_view()
+        matched_user = best_user if (best_user and best_sim >= THRESHOLD) else None
+        if self.mode in ("attendance", "lookup") and self._session_card is not None:
+            self._process_attendance(frame, faces, matched_user)
+        elif self.mode == "test" and self._session_card is not None:
+            self._process_camera_test(faces, matched_user, best_sim)
+
+        if self.mode in ("attendance", "lookup"):
+            return  # 출근/퇴근·출석 조회 중에는 카메라 영상을 화면에 그리지 않는다
 
         img = Image.fromarray(cv2.cvtColor(display, cv2.COLOR_BGR2RGB))
 
@@ -2350,6 +2747,9 @@ class AttendanceApp:
             for label_x, label_y, text, color_rgb in labels_to_draw:
                 draw.text((label_x + 1, label_y + 1), text, font=font, fill=(0, 0, 0))  # 가독성용 그림자
                 draw.text((label_x, label_y), text, font=font, fill=color_rgb)
+
+        if self._photo is None:  # 카메라를 켠 뒤 첫 화면 — fps가 계산되기 전에도 LIVE로 바꿔 둔다
+            self.lbl_cam_status.config(text="● LIVE", fg="#10B981")
 
         # PhotoImage는 크기가 같으면 새로 만들지 않고 픽셀만 덮어쓴다 (20ms → 9ms)
         if self._photo is None or (self._photo.width(), self._photo.height()) != img.size:
@@ -2383,38 +2783,112 @@ class AttendanceApp:
         else:
             self.lbl_liveness.config(text="👁 카메라를 바라봐 주세요", fg="#94A3B8")
 
-    def toggle_camera(self):
-        """카메라 화면 표시를 켜고 끈다. 꺼져 있는 동안은 얼굴 인식도 같이 멈춘다."""
-        self.camera_on = not self.camera_on
-
-        if self.camera_on:
-            self.lbl_cam_status.config(text="● LIVE", fg="#10B981")
-            self.btn_camera_toggle.config(text="📷 화면 끄기")
-            self.video_label.config(text="")
-            self._fps_count = 0
-            self._fps_since = time.perf_counter()
+    def _process_attendance(self, frame, faces, matched_user):
+        """
+        출근/퇴근을 누른 뒤 매 프레임 불린다. 같은 학생이 RECOGNIZE_HOLD_SECONDS 동안 계속 인식되고
+        사람 확인(위조판별 + 눈 깜빡임)까지 통과하면 그 순간 화면을 사진으로 남기고 자동으로 기록한다.
+        """
+        card = self._session_card
+        if not self.ai_ready:
+            card.set_status("얼굴 인식을 준비하고 있습니다. 잠시만 기다려 주세요...", "#F59E0B")
+            return
+        if matched_user is None:
+            self._candidate_id = None
+            if faces:
+                card.set_status("등록되지 않은 얼굴입니다.\n카메라 정면을 바라봐 주세요.", "#EF4444")
+            else:
+                card.set_status("얼굴을 찾는 중...")
             return
 
+        name = self._resolve_display_name(matched_user)
+        now = time.time()
+        if self._candidate_id != matched_user["user_id"]:
+            self._candidate_id = matched_user["user_id"]
+            self._candidate_since = now
+        if now - self._candidate_since < RECOGNIZE_HOLD_SECONDS:
+            card.set_status(f"{name} 학생 확인 중...", "#3B82F6")
+            return
+        if not self.passes_antispoof():
+            if (now - self.last_fake_time) <= LIVENESS_VALID_SECONDS:
+                card.set_status("사진이나 화면으로 판단됩니다.\n본인이 직접 카메라 앞에 서 주세요.", "#EF4444")
+            elif self.last_liveness_status == "input_rejected":
+                card.set_status("얼굴이 너무 가깝습니다.\n카메라에서 조금 물러나 주세요.", "#F59E0B")
+            else:
+                card.set_status(f"{name} 학생, 카메라를 정면으로 바라봐 주세요.", "#F59E0B")
+            return
+        if not self.has_recent_blink():
+            card.set_status(f"{name} 학생, 눈을 한 번 깜빡여 주세요.", "#F59E0B")
+            return
+
+        # 확인 완료 — 출근/퇴근이면 이 프레임을 사진으로 남기고 기록한다 (출석 조회는 조회만).
+        # 카드를 먼저 비워서 두 번 처리되지 않게 한다.
+        self._session_card = None
+        student = dict(matched_user)
+        student["name"] = name  # 최신 창공시스템 명단 이름 우선
+        snapshot = frame.copy()
+        self.window.after_idle(lambda: self.complete_attendance(student, snapshot))
+
+    def complete_attendance(self, student, snapshot):
+        if self.mode == "lookup":
+            self.show_idle()
+            self.open_popup(StatsDialog(self, student))  # 기록·사진 없이 본인 출석 현황만
+            return
+        log_type = self.pending_action
+        success, detail = log_attendance(student["user_id"], student["name"], log_type, snapshot)
+        self.show_idle()  # 카메라를 끄고 메인 화면으로 — 안내창은 그 위에 3초 동안 뜬다
+        self.open_popup(ResultPopup(self, student, log_type, success, detail))
+
+    def _process_camera_test(self, faces, matched_user, best_sim):
+        card = self._session_card
+        if not self.ai_ready:
+            card.set_status("얼굴 인식을 준비하고 있습니다. 잠시만 기다려 주세요...", "#F59E0B")
+        elif matched_user is not None:
+            card.set_status(f"정상 인식: {self._resolve_display_name(matched_user)} (유사도 {best_sim:.2f})",
+                            "#10B981")
+        elif faces:
+            card.set_status(f"얼굴은 보이지만 등록된 학생과 일치하지 않습니다 (최고 유사도 {max(best_sim, 0):.2f}, "
+                            f"기준 {THRESHOLD:.2f})", "#EF4444")
+        else:
+            card.set_status("카메라는 정상입니다. 얼굴이 보이지 않습니다.")
+
+    def set_camera(self, on):
+        """카메라와 얼굴 인식을 켜고 끈다. 실제 장치 열기/닫기는 캡처 스레드가 한다."""
+        if on == self.camera_on:
+            return
+        self.camera_generation += 1
+        self.camera_on = on
         self.latest_frame = None
-        self.cached_faces = []  # 꺼진 동안 예전 얼굴로 학생이 등록되지 않게 비운다
-        self.current_student_id = None
-
-        self.lbl_cam_status.config(text="● OFF", fg="#EF4444")
-        self.btn_camera_toggle.config(text="📷 화면 켜기")
+        self.cached_faces = []  # 꺼지거나 새로 켜면 예전 얼굴로 출결/등록이 되지 않게 비운다
         self._photo = None
-        self.video_label.config(
-            image="", text="📷\n\n카메라 화면이 꺼져 있습니다\n[화면 켜기]를 누르면 다시 표시됩니다",
-            fg="#64748B", font=(UI_FONT, 14, "bold")
-        )
+        self._fps_count = 0
+        self._fps_since = time.perf_counter()
+        self.lbl_liveness.config(text="")
+        if on:
+            self.camera_error = False
+            self.lbl_cam_status.config(text="● 카메라 켜는 중", fg="#F59E0B")
+            self.video_label.config(image="", text="📷\n\n카메라를 켜는 중입니다...",
+                                    fg="#64748B", font=(UI_FONT, 14, "bold"))
+        else:
+            self.lbl_cam_status.config(text="● OFF", fg="#EF4444")
+            self.video_label.config(image="", text="")
 
-        # 학생 카드가 떠 있었다면 기본 화면으로 (관리자 작업 중이면 그대로 둔다)
-        if not self.admin_logged_in and self.current_view_state == "student":
-            self.reset_to_default_view()
+    def _reset_liveness(self):
+        """다음 사람이 앞 사람의 깜빡임/실제 사람 판정을 이어받지 않도록 비운다."""
+        self.last_blink_time = 0.0
+        self._eye_closed = False
+        self.last_live_time = 0.0
+        self.last_fake_time = 0.0
+        self.last_liveness_status = None
 
     def _update_clock(self):
         if not self.is_running:
             return
-        self.lbl_clock.config(text=datetime.now().strftime("%Y-%m-%d  %H:%M:%S"))
+        now = datetime.now()
+        self.lbl_clock.config(text=now.strftime("%Y-%m-%d  %H:%M:%S"))
+        # 프로그램을 며칠씩 켜두어도 3개월 지난 사진이 지워지도록 날짜가 바뀌면 한 번 정리한다
+        if now.date() != self._photo_cleanup_date:
+            self._photo_cleanup_date = now.date()
+            threading.Thread(target=cleanup_old_photos, daemon=True).start()
         self.window.after(1000, self._update_clock)
 
     def _rebuild_embedding_matrix(self):
@@ -2453,47 +2927,103 @@ class AttendanceApp:
             return user["name"]
         return "?"
 
-    def show_student_view(self, student_info):
+    # ---------- 화면 전환 ----------
+    def open_popup(self, popup):
+        self._popups = [p for p in self._popups if p.winfo_exists()]
+        self._popups.append(popup)
+
+    def close_popups(self):
+        """앞 사람의 결과 안내창/출석 조회 창을 닫는다 (다음 사람이 보지 않도록)."""
+        for popup in self._popups:
+            if popup.winfo_exists():
+                popup.destroy()
+        self._popups = []
+
+    def _show_view(self, view):
+        """메인 / 확인 중 / 카메라 화면 중 하나만 보이게 한다."""
+        for other in (self.idle_view, self.checking_view, self.session_view):
+            if other is not view:
+                other.pack_forget()
+        view.pack(fill=tk.BOTH, expand=True)
+
+    def _show_session_layout(self):
+        self._show_view(self.session_view)
+
+    def _clear_session_cards(self):
         self.clear_right_container()
-        self.current_view_state = "student"
+        for widget in self.checking_view.winfo_children():
+            widget.destroy()
 
-        frame = StudentInfoFrame(self, student_info)
-        frame.pack(fill=tk.BOTH, expand=True)
+    def _start_session(self, mode, card_factory):
+        self.close_popups()
+        self.mode = mode
+        self.session_started = time.time()
+        self._candidate_id = None
+        self._reset_liveness()
+        self._clear_session_cards()
+        self._session_card = card_factory()
+        if mode in ("attendance", "lookup"):
+            # 카메라는 뒤에서만 돌고, 화면에는 안내 카드만 보인다
+            self._session_card.place(relx=0.5, rely=0.47, anchor=tk.CENTER,
+                                     width=px(RIGHT_PANEL_WIDTH), height=px(620))
+            self._show_view(self.checking_view)
+        else:
+            self._session_card.pack(fill=tk.BOTH, expand=True)
+            self._show_session_layout()
+        self.set_camera(True)
 
-    def show_admin_login(self):
-        """학생 얼굴 인식 화면에서 [관리자]를 눌렀을 때 — 로그인 화면으로 바로 전환한다."""
+    def start_attendance(self, log_type):
+        """메인 화면에서 출근/퇴근을 눌렀을 때 — 카메라를 (화면에 띄우지 않고) 켜고 얼굴을 기다린다."""
+        self.pending_action = log_type
+        self._start_session("attendance", lambda: AttendanceWaitingFrame(self, log_type, self.checking_view))
+
+    def start_lookup(self):
+        """상단 [출석 조회] — 얼굴로 본인 확인 후 그 학생의 출석 시간만 보여준다 (기록하지 않는다)."""
+        self.pending_action = None
+        self._start_session("lookup", lambda: LookupWaitingFrame(self, self.checking_view))
+
+    def start_camera_test(self):
+        """상단 [카메라 테스트] — 기록 없이 카메라 화면과 인식 결과만 보여준다."""
+        self.pending_action = None
+        self._start_session("test", lambda: CameraTestFrame(self))
+
+    def show_idle(self):
+        """메인 화면 — 카메라와 얼굴 인식을 끄고 출근/퇴근 버튼만 보여준다."""
+        self.mode = "idle"
+        self.pending_action = None
+        self._candidate_id = None
+        self._session_card = None
+        self._clear_session_cards()
+        self.set_camera(False)
+        self._show_view(self.idle_view)
+        self.btn_admin_header.config(text="🔑 관리자")
+        if not self.header_tools.winfo_ismapped():
+            self.header_tools.pack(side=tk.RIGHT, padx=(px(20), 0), before=self.lbl_clock)
+
+    def on_admin_header_button(self):
         if self.admin_logged_in:
-            self.set_admin_logged_in(True, self.admin_email)
+            self.set_admin_logged_in(False)
             return
-
-        self.admin_login_requested = True
-        self.clear_right_container()
-        self.current_view_state = "login"
-
-        frame = AdminLoginFrame(self)
-        frame.pack(fill=tk.BOTH, expand=True)
-
-    def reset_to_default_view(self):
-        self.clear_right_container()
-        self.current_student_id = None
-        self.current_view_state = "login"
-        self.admin_login_requested = False
-
-        frame = AdminLoginFrame(self)
-        frame.pack(fill=tk.BOTH, expand=True)
+        AdminLoginDialog(self)
 
     def set_admin_logged_in(self, logged_in, admin_email=""):
         self.admin_logged_in = logged_in
         self.admin_email = admin_email
-        self.admin_login_requested = False
-        self.clear_right_container()
+        if not logged_in:
+            self.show_idle()
+            return
 
-        if logged_in:
-            self.current_view_state = "admin"
-            frame = AdminDashboardFrame(self, admin_email)
-            frame.pack(fill=tk.BOTH, expand=True)
-        else:
-            self.reset_to_default_view()
+        self.close_popups()
+        self.mode = "admin"
+        self.pending_action = None
+        self._session_card = None
+        self._clear_session_cards()
+        frame = AdminDashboardFrame(self, admin_email)
+        frame.pack(fill=tk.BOTH, expand=True)
+        self._show_session_layout()
+        self.set_camera(True)  # 학생 등록 탭에서 얼굴을 찍어야 하므로 켜둔다
+        self.btn_admin_header.config(text="🔒 관리자 로그아웃")
+        self.header_tools.pack_forget()  # 관리자 화면은 이미 카메라가 켜져 있다
 
     def clear_right_container(self):
         for widget in self.right_container.winfo_children():
@@ -2501,8 +3031,7 @@ class AttendanceApp:
 
     def on_close(self):
         self.is_running = False
-        self.capture_thread.join(timeout=1.0)  # 읽는 도중에 release하면 드라이버가 멈출 수 있다
-        self.cap.release()
+        self.capture_thread.join(timeout=1.0)  # 카메라는 캡처 스레드가 닫고 끝난다
         self.face_proc.terminate()
         self.window.destroy()
 

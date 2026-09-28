@@ -117,6 +117,8 @@ server/test-results/
 faces.db
 faces.db-journal
 *.part
+# 출퇴근 순간 얼굴 사진 (관리자 전용, 90일 뒤 자동 삭제)
+attendance_photos/
 
 # IDE / 에디터 설정
 .vs/

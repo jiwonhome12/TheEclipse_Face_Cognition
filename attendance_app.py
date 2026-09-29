@@ -36,6 +36,7 @@ if sys.stdout is None or sys.stderr is None:
 
 DB_PATH = os.path.join(APP_DIR, "faces.db")
 THRESHOLD = 0.50
+DEPARTMENT_NAME = "소프트웨어전공"  # 학과는 한 곳뿐이라 입력받지 않고 이 값으로 고정한다
 
 # 사진/화면 영상으로 대리 출석하는 것을 막기 위한 눈 깜빡임 검사 (MediaPipe FaceLandmarker)
 # 모델 파일이 없으면 검사는 자동으로 꺼지고, 출퇴근은 예전처럼 그대로 동작한다.
@@ -699,7 +700,7 @@ def init_db():
             user_id TEXT UNIQUE,
             password TEXT NOT NULL DEFAULT '1234',
             name TEXT NOT NULL,
-            major TEXT NOT NULL DEFAULT '컴퓨터 공학 전공',
+            major TEXT NOT NULL DEFAULT '소프트웨어전공',
             role TEXT NOT NULL DEFAULT 'student', -- 'admin' 또는 'student'
             embedding BLOB NOT NULL,
             penalty INTEGER DEFAULT 0,
@@ -713,7 +714,7 @@ def init_db():
     except sqlite3.OperationalError:
         pass
     try:
-        cursor.execute("ALTER TABLE users ADD COLUMN major TEXT NOT NULL DEFAULT '컴퓨터 공학 전공'")
+        cursor.execute("ALTER TABLE users ADD COLUMN major TEXT NOT NULL DEFAULT '소프트웨어전공'")
     except sqlite3.OperationalError:
         pass
     try:
@@ -1526,6 +1527,16 @@ class AdminDashboardFrame(tk.Frame):
         )
         btn_logout.pack(side=tk.RIGHT, pady=5)
 
+        # 관리자 작업 중에 카메라 화면을 끄고 켤 수 있는 버튼
+        self.btn_camera = Button(
+            top_bar, text="📷 화면 끄기", fg="white", font=(UI_FONT, 10, "bold"),
+            activeforeground="white", bd=0, padx=16, pady=6, cursor="hand2",
+            command=self.toggle_camera
+        )
+        self.btn_camera.pack(side=tk.RIGHT, pady=5, padx=(0, px(8)))
+        # 관리자 화면에 들어오면서 카메라가 켜지므로, 그 다음에 버튼 상태를 맞춘다
+        self.after(0, self.sync_camera_button)
+
         # 2행: 기능 버튼 — 한 줄에 몰아넣으면 글자가 잘려서 아래 줄에 반반 나눠 배치
         action_bar = tk.Frame(self, bg="white")
         action_bar.pack(fill=tk.X, padx=px(12), pady=(0, px(8)))
@@ -1559,6 +1570,19 @@ class AdminDashboardFrame(tk.Frame):
         self.build_students_tab()
         self.build_add_student_tab()
         self.build_logs_tab()
+
+    def toggle_camera(self):
+        """카메라 화면을 켜고 끈다. 꺼두면 얼굴 인식도 멈춰서 학생 등록은 다시 켜야 한다."""
+        self.parent.set_camera(not self.parent.camera_on)
+        self.sync_camera_button()
+
+    def sync_camera_button(self):
+        if not self.btn_camera.winfo_exists():
+            return
+        if self.parent.camera_on:
+            self.btn_camera.config(text="📷 화면 끄기", bg="#334155", activebackground="#475569")
+        else:
+            self.btn_camera.config(text="📷 화면 켜기", bg="#10B981", activebackground="#059669")
 
     def logout(self):
         self.parent.set_admin_logged_in(False)
@@ -1741,6 +1765,7 @@ class AdminDashboardFrame(tk.Frame):
         self.edit_name = ttk.Entry(form_frame, width=9)
         self.edit_name.grid(row=0, column=1, padx=5, pady=5, sticky=tk.EW)
 
+        # 이미 등록된 학생의 전공은 그대로 두고 여기서 고칠 수 있게 남겨둔다 (신규 등록만 고정)
         ttk.Label(form_frame, text="전공:").grid(row=0, column=2, padx=5, pady=5, sticky=tk.W)
         self.edit_major = ttk.Entry(form_frame, width=12)
         self.edit_major.grid(row=0, column=3, padx=5, pady=5, sticky=tk.EW)
@@ -1792,10 +1817,10 @@ class AdminDashboardFrame(tk.Frame):
         self.add_name = ttk.Entry(grid_container, font=(UI_FONT, 11), width=26)
         self.add_name.grid(row=3, column=1, padx=px(10), pady=px(8), sticky=tk.W)
 
+        # 학과는 소프트웨어전공으로 고정이라 입력받지 않고 보여주기만 한다
         ttk.Label(grid_container, text="전공 학과:", font=(UI_FONT, 10, "bold"), background="#F8FAFC").grid(row=4, column=0, padx=px(10), pady=px(8), sticky=tk.W)
-        self.add_major = ttk.Entry(grid_container, font=(UI_FONT, 11), width=26)
-        self.add_major.grid(row=4, column=1, padx=px(10), pady=px(8), sticky=tk.W)
-        self.add_major.insert(0, "컴퓨터 공학 전공")
+        ttk.Label(grid_container, text=DEPARTMENT_NAME, font=(UI_FONT, 11), background="#F8FAFC",
+                  foreground="#334155").grid(row=4, column=1, padx=px(10), pady=px(8), sticky=tk.W)
 
         # 등록 버튼 크기 강화
         btn_register = Button(
@@ -1850,9 +1875,7 @@ class AdminDashboardFrame(tk.Frame):
         self.add_id.insert(0, student.get("StudentId", ""))
         self.add_name.delete(0, tk.END)
         self.add_name.insert(0, student.get("Name", ""))
-        if student.get("Department"):
-            self.add_major.delete(0, tk.END)
-            self.add_major.insert(0, student.get("Department", ""))
+        # 창공시스템 명단에 학과가 들어 있어도 쓰지 않는다 — 학과는 소프트웨어전공으로 고정
 
     def build_logs_tab(self):
         # 상단 조회 조건
@@ -1903,13 +1926,21 @@ class AdminDashboardFrame(tk.Frame):
         list_container = tk.Frame(self.tab_logs)
         list_container.pack(fill=tk.BOTH, expand=True, padx=5, pady=(5, 0))
 
-        scroll = ttk.Scrollbar(list_container)
-        scroll.pack(side=tk.RIGHT, fill=tk.Y)
+        # 가로/세로 스크롤바 — 컬럼이 화면보다 넓어지면 아래 드래그바로 좌우로 움직인다
+        scroll = ttk.Scrollbar(list_container, orient=tk.VERTICAL)
+        scroll_x = ttk.Scrollbar(list_container, orient=tk.HORIZONTAL)
 
-        self.tree_logs = ttk.Treeview(list_container, show="headings", yscrollcommand=scroll.set)
+        self.tree_logs = ttk.Treeview(list_container, show="headings",
+                                      yscrollcommand=scroll.set, xscrollcommand=scroll_x.set)
         self.tree_logs.tag_configure("invalid", foreground="#94A3B8")
-        self.tree_logs.pack(fill=tk.BOTH, expand=True)
         scroll.config(command=self.tree_logs.yview)
+        scroll_x.config(command=self.tree_logs.xview)
+
+        self.tree_logs.grid(row=0, column=0, sticky=tk.NSEW)
+        scroll.grid(row=0, column=1, sticky=tk.NS)
+        scroll_x.grid(row=1, column=0, sticky=tk.EW)
+        list_container.rowconfigure(0, weight=1)
+        list_container.columnconfigure(0, weight=1)
         self.tree_logs.bind("<Double-1>", lambda e: self.show_log_photo())
         self._log_photos = {}  # 트리뷰 행 id → (사진 상대 경로, 설명)
 
@@ -2022,7 +2053,8 @@ class AdminDashboardFrame(tk.Frame):
         self.tree_logs["displaycolumns"] = "#all"
         for key, heading, width, anchor in columns:
             self.tree_logs.heading(key, text=heading)
-            self.tree_logs.column(key, width=px(width), anchor=anchor)
+            # stretch=False — 창 폭에 맞춰 늘어나지 않게 해야 넘칠 때 가로 스크롤바로 움직일 수 있다
+            self.tree_logs.column(key, width=px(width), minwidth=px(width), anchor=anchor, stretch=False)
 
     def _show_log_rows(self, start, end, keyword):
         self._set_log_columns([
@@ -2141,6 +2173,7 @@ class AdminDashboardFrame(tk.Frame):
         self.edit_major.delete(0, tk.END)
         self.edit_major.insert(0, values[2])
 
+
         self.edit_penalty.delete(0, tk.END)
         self.edit_penalty.insert(0, values[3])
 
@@ -2247,9 +2280,9 @@ class AdminDashboardFrame(tk.Frame):
         s_id = self.add_id.get().strip()
         pwd = self.add_pwd.get().strip()
         name = self.add_name.get().strip()
-        major = self.add_major.get().strip()
+        major = DEPARTMENT_NAME
 
-        if not (s_id and pwd and name and major):
+        if not (s_id and pwd and name):
             messagebox.showwarning("입력 미달", "모든 정보를 입력하세요.")
             return
 

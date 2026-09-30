@@ -13,7 +13,7 @@ from datetime import date, datetime, timedelta
 import tkinter as tk
 from tkinter import ttk, messagebox, filedialog
 from tkinter import font as tkfont
-from PIL import Image, ImageDraw, ImageFont, ImageTk
+from PIL import Image, ImageDraw, ImageFont, ImageTk, ImageSequence
 
 # 프로그램 파일이 있는 폴더 — 어느 폴더에서 실행해도 같은 DB/모델을 쓰도록 기준으로 삼는다
 # exe(PyInstaller)로 실행하면 데이터(DB·사진·로그)는 exe 옆에, 같이 묶은 파일은 _internal 폴더에 있다.
@@ -48,6 +48,10 @@ LIVENESS_MODEL_URL = (
 BLINK_CLOSED_SCORE = 0.5    # 이 값을 넘으면 눈을 감은 것으로 본다
 BLINK_OPEN_SCORE = 0.3      # 다시 이 아래로 내려오면 한 번 깜빡인 것으로 센다
 BLINK_VALID_SECONDS = 10    # 출퇴근을 누르기 전 이 시간 안에 깜빡임이 있어야 한다
+
+# 출근/퇴근 확인 중 "눈을 깜빡여 주세요" 안내가 뜰 때 같이 보여주는 힌트 이미지.
+# 파일이 없어도 이미지만 안 뜰 뿐 출퇴근은 그대로 동작한다.
+BLINK_HINT_IMAGE_PATH = os.path.join(RESOURCE_DIR, "assets", "blink_hint.gif")
 
 # InsightFace 공식 위조판별(liveness) 애드온 기준 점수. 이 값 이상이면 실제 사람으로 본다.
 # 모델은 처음 실행할 때 ~/.insightface/addons/liveness.onnx 로 자동 다운로드된다.
@@ -1170,6 +1174,31 @@ class AdminLoginDialog(tk.Toplevel):
         self.app.set_admin_logged_in(True, user_id)
 
 
+_blink_hint_frames_cache = {}
+
+
+def _get_blink_hint_frames(size):
+    """'눈을 깜빡여 주세요' 안내에 같이 보여줄 힌트 이미지를 size(px) 정사각형으로 불러온다.
+    움직이는 GIF/WEBP면 프레임 전체를 (PhotoImage, 이 프레임을 보여줄 시간ms) 목록으로 돌려준다.
+    정지 이미지면 프레임이 하나뿐인 목록. 파일이 없거나 못 읽으면 빈 목록(이미지 없이 문구만 보인다)."""
+    frames = _blink_hint_frames_cache.get(size)
+    if frames is not None:
+        return frames
+    frames = []
+    if os.path.exists(BLINK_HINT_IMAGE_PATH):
+        try:
+            src = Image.open(BLINK_HINT_IMAGE_PATH)
+            for frame in ImageSequence.Iterator(src):
+                duration = frame.info.get("duration", 100) or 100
+                resized = frame.convert("RGBA").resize((size, size), Image.LANCZOS)
+                frames.append((ImageTk.PhotoImage(resized), duration))
+        except Exception as e:
+            print(f"[출석] 눈 깜빡임 안내 이미지를 불러오지 못했습니다 ({e})")
+            frames = []
+    _blink_hint_frames_cache[size] = frames
+    return frames
+
+
 class SessionCard(tk.Frame):
     """카메라가 켜진 동안 오른쪽에 뜨는 안내 카드의 공통 틀 (제목 · 안내 · 상태 · 남은 시간 · 닫기 버튼)."""
 
@@ -1192,6 +1221,17 @@ class SessionCard(tk.Frame):
                                    wraplength=px(RIGHT_PANEL_WIDTH - 140))
         self.lbl_status.pack(fill=tk.X, pady=(px(28), 0))
 
+        # 눈을 깜빡이라는 문구만으로는 잘 와닿지 않아서, 깜빡이는 모습을 보여주는 이미지를
+        # 그 순간에만 카드 오른쪽 위 모서리에 띄운다. 이미지가 없으면 만들지 않는다.
+        # place()로 self(카드 전체) 기준 오른쪽 위에 고정하면, inner의 pack 흐름과 상관없이
+        # 항상 같은 자리(모서리)에 뜬다.
+        self._blink_frames = _get_blink_hint_frames(px(160))
+        self._blink_frame_idx = 0
+        self._blink_anim_job = None
+        self.lbl_blink_hint = None
+        if self._blink_frames:
+            self.lbl_blink_hint = tk.Label(self, image=self._blink_frames[0][0], bg="white", bd=0)
+
         Button(
             inner, text=close_text, bg="#E2E8F0", fg="#334155", bd=0,
             activebackground="#CBD5E1", activeforeground="#1E293B",
@@ -1200,10 +1240,36 @@ class SessionCard(tk.Frame):
         self.lbl_remaining = tk.Label(inner, text="", font=(UI_FONT, 10), bg="white", fg="#94A3B8")
         self.lbl_remaining.pack(side=tk.BOTTOM, anchor=tk.E, pady=(0, px(6)))
 
-    def set_status(self, text, fg="#475569"):
+    def set_status(self, text, fg="#475569", blink_hint=False):
         # 화면이 매 프레임 불러서 글자가 바뀔 때만 다시 그린다
         if self.lbl_status.cget("text") != text or self.lbl_status.cget("fg") != fg:
             self.lbl_status.config(text=text, fg=fg)
+        if self.lbl_blink_hint is not None:
+            is_showing = bool(self.lbl_blink_hint.winfo_manager())
+            if blink_hint and not is_showing:
+                self.lbl_blink_hint.place(relx=1.0, rely=0.0, x=-px(14), y=px(14), anchor=tk.NE)
+                self._start_blink_animation()
+            elif not blink_hint and is_showing:
+                self.lbl_blink_hint.place_forget()
+                self._stop_blink_animation()
+
+    def _start_blink_animation(self):
+        if len(self._blink_frames) <= 1 or self._blink_anim_job is not None:
+            return  # 프레임이 하나뿐(정지 이미지)이면 애니메이션이 필요 없다
+        self._advance_blink_frame()
+
+    def _stop_blink_animation(self):
+        if self._blink_anim_job is not None:
+            self.after_cancel(self._blink_anim_job)
+            self._blink_anim_job = None
+
+    def _advance_blink_frame(self):
+        if not self.winfo_exists():
+            return
+        self._blink_frame_idx = (self._blink_frame_idx + 1) % len(self._blink_frames)
+        photo, duration = self._blink_frames[self._blink_frame_idx]
+        self.lbl_blink_hint.config(image=photo)
+        self._blink_anim_job = self.after(duration, self._advance_blink_frame)
 
     def set_remaining(self, seconds):
         text = f"{seconds}초 뒤 처음 화면으로 돌아갑니다"
@@ -1809,18 +1875,14 @@ class AdminDashboardFrame(tk.Frame):
         self.add_id = ttk.Entry(grid_container, font=(UI_FONT, 11), width=26)
         self.add_id.grid(row=1, column=1, padx=px(10), pady=px(8), sticky=tk.W)
 
-        ttk.Label(grid_container, text="비밀번호:", font=(UI_FONT, 10, "bold"), background="#F8FAFC").grid(row=2, column=0, padx=px(10), pady=px(8), sticky=tk.W)
-        self.add_pwd = ttk.Entry(grid_container, show="*", font=(UI_FONT, 11), width=26)
-        self.add_pwd.grid(row=2, column=1, padx=px(10), pady=px(8), sticky=tk.W)
-
-        ttk.Label(grid_container, text="이름:", font=(UI_FONT, 10, "bold"), background="#F8FAFC").grid(row=3, column=0, padx=px(10), pady=px(8), sticky=tk.W)
+        ttk.Label(grid_container, text="이름:", font=(UI_FONT, 10, "bold"), background="#F8FAFC").grid(row=2, column=0, padx=px(10), pady=px(8), sticky=tk.W)
         self.add_name = ttk.Entry(grid_container, font=(UI_FONT, 11), width=26)
-        self.add_name.grid(row=3, column=1, padx=px(10), pady=px(8), sticky=tk.W)
+        self.add_name.grid(row=2, column=1, padx=px(10), pady=px(8), sticky=tk.W)
 
         # 학과는 소프트웨어전공으로 고정이라 입력받지 않고 보여주기만 한다
-        ttk.Label(grid_container, text="전공 학과:", font=(UI_FONT, 10, "bold"), background="#F8FAFC").grid(row=4, column=0, padx=px(10), pady=px(8), sticky=tk.W)
+        ttk.Label(grid_container, text="전공 학과:", font=(UI_FONT, 10, "bold"), background="#F8FAFC").grid(row=3, column=0, padx=px(10), pady=px(8), sticky=tk.W)
         ttk.Label(grid_container, text=DEPARTMENT_NAME, font=(UI_FONT, 11), background="#F8FAFC",
-                  foreground="#334155").grid(row=4, column=1, padx=px(10), pady=px(8), sticky=tk.W)
+                  foreground="#334155").grid(row=3, column=1, padx=px(10), pady=px(8), sticky=tk.W)
 
         # 등록 버튼 크기 강화
         btn_register = Button(
@@ -1828,7 +1890,7 @@ class AdminDashboardFrame(tk.Frame):
             activebackground="#059669", activeforeground="white", font=(UI_FONT, 12, "bold"),
             height=2, cursor="hand2", command=self.register_student
         )
-        btn_register.grid(row=5, column=0, columnspan=3, pady=px(25), sticky=tk.EW)
+        btn_register.grid(row=4, column=0, columnspan=3, pady=px(25), sticky=tk.EW)
 
         self._roster_map = {}
         self.reload_roster_combo()
@@ -2278,11 +2340,10 @@ class AdminDashboardFrame(tk.Frame):
 
     def register_student(self):
         s_id = self.add_id.get().strip()
-        pwd = self.add_pwd.get().strip()
         name = self.add_name.get().strip()
         major = DEPARTMENT_NAME
 
-        if not (s_id and pwd and name):
+        if not (s_id and name):
             messagebox.showwarning("입력 미달", "모든 정보를 입력하세요.")
             return
 
@@ -2325,15 +2386,14 @@ class AdminDashboardFrame(tk.Frame):
 
         emb = new_embedding.tobytes()
         cursor.execute("""
-            INSERT INTO users (user_id, password, name, major, role, embedding, penalty)
-            VALUES (?, ?, ?, ?, ?, ?, 0)
-        """, (s_id, pwd, name, major, 'student', emb))
+            INSERT INTO users (user_id, name, major, role, embedding, penalty)
+            VALUES (?, ?, ?, ?, ?, 0)
+        """, (s_id, name, major, 'student', emb))
         conn.commit()
         conn.close()
 
         messagebox.showinfo("성공", f"[{name}] 학생이 성공적으로 등록되었습니다.")
         self.add_id.delete(0, tk.END)
-        self.add_pwd.delete(0, tk.END)
         self.add_name.delete(0, tk.END)
 
         self.load_students()
@@ -2908,24 +2968,23 @@ class AttendanceApp:
                 card.set_status(f"{name} 학생, 카메라를 정면으로 바라봐 주세요.", "#F59E0B")
             return
         if not self.has_recent_blink():
-            card.set_status(f"{name} 학생, 눈을 한 번 깜빡여 주세요.", "#F59E0B")
+            card.set_status(f"{name} 학생, 눈을 한 번 깜빡여 주세요.", "#F59E0B", blink_hint=True)
             return
 
-        # 확인 완료 — 출근/퇴근이면 이 프레임을 사진으로 남기고 기록한다 (출석 조회는 조회만).
+        # 확인 완료 — 출근/퇴근이면 기록한다 (출석 조회는 조회만). 사진은 남기지 않는다.
         # 카드를 먼저 비워서 두 번 처리되지 않게 한다.
         self._session_card = None
         student = dict(matched_user)
         student["name"] = name  # 최신 창공시스템 명단 이름 우선
-        snapshot = frame.copy()
-        self.window.after_idle(lambda: self.complete_attendance(student, snapshot))
+        self.window.after_idle(lambda: self.complete_attendance(student))
 
-    def complete_attendance(self, student, snapshot):
+    def complete_attendance(self, student):
         if self.mode == "lookup":
             self.show_idle()
             self.open_popup(StatsDialog(self, student))  # 기록·사진 없이 본인 출석 현황만
             return
         log_type = self.pending_action
-        success, detail = log_attendance(student["user_id"], student["name"], log_type, snapshot)
+        success, detail = log_attendance(student["user_id"], student["name"], log_type)
         self.show_idle()  # 카메라를 끄고 메인 화면으로 — 안내창은 그 위에 3초 동안 뜬다
         self.open_popup(ResultPopup(self, student, log_type, success, detail))
 

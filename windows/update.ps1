@@ -13,11 +13,5 @@ $pythonFile = Join-Path $PSScriptRoot "python_path.txt"
 if (Test-Path $pythonFile) {
     $python = (Get-Content $pythonFile -Raw).Trim()
     & $python -m pip install -r (Join-Path $AppDir "requirements.txt")
-    # mediapipe(눈 깜빡임 검사)는 requirements.txt에 없다 — 그냥 설치하면 딸려오는
-    # opencv-contrib-python이 opencv-python(cv2)을 덮어써서 얼굴 인식이 깨질 수 있어서
-    # install.ps1과 똑같이 --no-deps로 따로 설치한다 (install.ps1 참고).
-    & $python -m pip install --no-deps mediapipe
-    & $python -m pip install absl-py sounddevice flatbuffers matplotlib certifi
 }
 Write-Host "업데이트 완료. 프로그램을 껐다가 다시 켜면 새 버전이 적용됩니다." -ForegroundColor Green
-Write-Host "(학생 얼굴 등록 정보가 담긴 faces.db·attendance_photos는 git에 없는 파일이라 그대로 남아 있습니다.)"

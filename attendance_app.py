@@ -1,26 +1,15 @@
-import os
-
-# MediaPipe/TFLite는 C++ 쪽에서 stderr로 안내 로그(XNNPACK delegate, feedback manager 등)를 직접 찍는다.
-# 파이썬 logging으로는 막히지 않고, 이 설정은 mediapipe를 불러오기 전에 해야 효과가 있어서 맨 위에 둔다.
-os.environ.setdefault("GLOG_minloglevel", "3")        # 0=INFO 1=WARNING 2=ERROR 3=FATAL
-os.environ.setdefault("GLOG_stderrthreshold", "3")
-os.environ.setdefault("GLOG_logtostderr", "0")
-os.environ.setdefault("TF_CPP_MIN_LOG_LEVEL", "3")
-os.environ.setdefault("ABSL_MIN_LOG_LEVEL", "3")
-
-import contextlib
 import cv2
-import io
 import numpy as np
 import threading
 import time
 import sqlite3
 import json
+import os
 import shutil
 import sys
 import multiprocessing
 import calendar
-import random
+import math
 from datetime import date, datetime, timedelta
 import tkinter as tk
 from tkinter import ttk, messagebox, filedialog
@@ -42,14 +31,7 @@ else:
 # (얼굴 인식 프로세스도 이 파일을 다시 불러오므로 거기에도 똑같이 적용된다)
 if sys.stdout is None or sys.stderr is None:
     os.makedirs(os.path.join(APP_DIR, "logs"), exist_ok=True)
-    _log_path = os.path.join(APP_DIR, "logs", "app.log")
-    # 매일 켜두면 이 파일이 계속 자라기만 해서, 너무 커지면 옛 내용을 app.log.1로 밀어내고 새로 시작한다
-    try:
-        if os.path.getsize(_log_path) > 5 * 1024 * 1024:  # 5MB
-            os.replace(_log_path, _log_path + ".1")
-    except OSError:
-        pass
-    _log_file = open(_log_path, "a", encoding="utf-8", buffering=1)
+    _log_file = open(os.path.join(APP_DIR, "logs", "app.log"), "a", encoding="utf-8", buffering=1)
     sys.stdout = sys.stdout or _log_file
     sys.stderr = sys.stderr or _log_file
 
@@ -109,21 +91,6 @@ IS_WINDOWS = sys.platform.startswith("win")
 
 # 화면 글꼴 — 맑은 고딕은 윈도우에만 있어서 macOS에서는 기본 한글 글꼴(애플 SD 산돌고딕 Neo)을 쓴다
 UI_FONT = "Apple SD Gothic Neo" if IS_MAC else "맑은 고딕"
-
-# ===== 화면 디자인 (The Eclipse 테마) — 그리는 함수들은 0-3 구역에 있다 =====
-CARD_BG = "#F2F7FB"          # 카드 안쪽 (위젯 bg를 이 색으로 맞춰야 카드와 이어져 보인다)
-CARD_RADIUS = 30
-CHIP_BG = "#16263F"          # 상단에 떠 있는 작은 칩(시계·버튼) 바탕
-TEXT_MAIN = "#1B3B5F"        # 카드 위 진한 제목
-TEXT_SUB = "#5B7897"         # 카드 위 보조 설명
-TEXT_FAINT = "#90A6BC"
-CHIP_TEXT = "#D7E4F2"
-ACCENT_TOP, ACCENT_BOTTOM = "#7DB6E8", "#4A8CCB"      # 알약 버튼 기본 (파랑 그라데이션)
-ACCENT_TOP_HOVER, ACCENT_BOTTOM_HOVER = "#92C4EF", "#5B9BD8"
-_BG_CACHE = {}
-_PILL_CACHE = {}
-_BG_PHOTO_UNSET = object()
-_BG_PHOTO = _BG_PHOTO_UNSET
 
 # macOS의 Tk는 사진을 화면에 올리는 속도(PhotoImage.paste)가 윈도우보다 3~4배 느리다
 # (944x708 기준 윈도우 9ms / 맥 30ms 이상). 카메라 원본이 640x480이라 크게 늘려도 화질은 그대로이므로,
@@ -186,32 +153,6 @@ def download_liveness_model():
         return False
 
 
-@contextlib.contextmanager
-def silence_native_stderr():
-    """
-    C++ 라이브러리(MediaPipe/TFLite)가 stderr로 직접 쓰는 안내 메시지를 잠깐 막는다.
-    환경변수(GLOG_*)로 안 막히는 absl 로그까지 확실히 숨기려면 파일 디스크립터 수준에서 돌려야 한다.
-    파이썬 쪽 print는 건드리지 않으므로 우리 메시지는 그대로 보인다.
-    """
-    try:
-        fd = sys.stderr.fileno()
-    except (AttributeError, ValueError, io.UnsupportedOperation):
-        yield  # pythonw처럼 진짜 stderr가 없는 경우 — 막을 것도 없다
-        return
-
-    saved_fd = os.dup(fd)
-    devnull_fd = os.open(os.devnull, os.O_WRONLY)
-    try:
-        sys.stderr.flush()
-        os.dup2(devnull_fd, fd)
-        yield
-    finally:
-        sys.stderr.flush()
-        os.dup2(saved_fd, fd)
-        os.close(saved_fd)
-        os.close(devnull_fd)
-
-
 def create_blink_detector():
     """
     MediaPipe FaceLandmarker를 준비한다. 눈 깜빡임 정도(blendshape)를 읽어
@@ -223,20 +164,18 @@ def create_blink_detector():
         if not download_liveness_model():
             return None
     try:
-        # 모델을 불러오는 동안 MediaPipe가 찍는 안내 로그는 숨긴다 (silence_native_stderr 참고)
-        with silence_native_stderr():
-            from mediapipe.tasks.python import BaseOptions
-            from mediapipe.tasks.python import vision
-            # 경로 대신 파일 내용을 넘긴다 — MediaPipe는 한글이 들어간 경로(예: '새 폴더')를 열지 못해서
-            # 경로로 넘기면 깜빡임 검사가 소리 없이 꺼진다
-            with open(LIVENESS_MODEL_PATH, "rb") as f:
-                model_bytes = f.read()
-            return vision.FaceLandmarker.create_from_options(vision.FaceLandmarkerOptions(
-                base_options=BaseOptions(model_asset_buffer=model_bytes),
-                running_mode=vision.RunningMode.VIDEO,
-                output_face_blendshapes=True,   # eyeBlinkLeft / eyeBlinkRight 값을 쓰기 위해
-                num_faces=1,
-            ))
+        from mediapipe.tasks.python import BaseOptions
+        from mediapipe.tasks.python import vision
+        # 경로 대신 파일 내용을 넘긴다 — MediaPipe는 한글이 들어간 경로(예: '새 폴더')를 열지 못해서
+        # 경로로 넘기면 깜빡임 검사가 소리 없이 꺼진다
+        with open(LIVENESS_MODEL_PATH, "rb") as f:
+            model_bytes = f.read()
+        return vision.FaceLandmarker.create_from_options(vision.FaceLandmarkerOptions(
+            base_options=BaseOptions(model_asset_buffer=model_bytes),
+            running_mode=vision.RunningMode.VIDEO,
+            output_face_blendshapes=True,   # eyeBlinkLeft / eyeBlinkRight 값을 쓰기 위해
+            num_faces=1,
+        ))
     except Exception as e:
         print(f"[출석] 깜빡임 검사를 켜지 못했습니다 ({type(e).__name__}: {e})")
         return None
@@ -343,29 +282,23 @@ def face_inference_process(conn, threads):
     conn.send("ready")
     while True:
         frame = conn.recv()
-        # 프레임 한 장을 처리하다 생기는 예외로 인식 프로세스 전체가 죽어서 그 뒤로
-        # 인식이 영영 멈추는 일이 없도록, 한 프레임 단위로만 실패하고 다음 프레임을 계속 받는다.
-        try:
-            faces = app.get(frame)
+        faces = app.get(frame)
 
-            # 깜빡임은 "인식된 얼굴"에서만 본다. 화면 전체로 보면 사진을 들고 있는 사람의
-            # 깜빡임이 대신 잡혀서 사진이 통과한다. 가장 큰 얼굴(= 인식 대상)만 잘라서 검사한다.
-            blink_score = None
-            liveness = None   # (is_live, status) — 위조판별 애드온 결과
-            if faces:
-                main_face = max(faces, key=lambda f: (f.bbox[2] - f.bbox[0]) * (f.bbox[3] - f.bbox[1]))
-                face_crop = crop_face_region(frame, main_face.bbox)
-                # MediaPipe VIDEO 모드는 타임스탬프가 계속 커져야 한다
-                blink_score = detect_blink_score(blink_landmarker, face_crop, int(time.perf_counter() * 1000))
+        # 깜빡임은 "인식된 얼굴"에서만 본다. 화면 전체로 보면 사진을 들고 있는 사람의
+        # 깜빡임이 대신 잡혀서 사진이 통과한다. 가장 큰 얼굴(= 인식 대상)만 잘라서 검사한다.
+        blink_score = None
+        liveness = None   # (is_live, status) — 위조판별 애드온 결과
+        if faces:
+            main_face = max(faces, key=lambda f: (f.bbox[2] - f.bbox[0]) * (f.bbox[3] - f.bbox[1]))
+            face_crop = crop_face_region(frame, main_face.bbox)
+            # MediaPipe VIDEO 모드는 타임스탬프가 계속 커져야 한다
+            blink_score = detect_blink_score(blink_landmarker, face_crop, int(time.perf_counter() * 1000))
 
-                result = getattr(main_face, "liveness", None)
-                if result is not None:
-                    liveness = (result.is_live, result.status)
+            result = getattr(main_face, "liveness", None)
+            if result is not None:
+                liveness = (result.is_live, result.status)
 
-            conn.send(([(f.bbox, f.embedding) for f in faces], blink_score, liveness))
-        except Exception as e:
-            print(f"[출석] 얼굴 인식 중 오류가 있었지만 계속 진행합니다 ({type(e).__name__}: {e})")
-            conn.send(([], None, None))
+        conn.send(([(f.bbox, f.embedding) for f in faces], blink_score, liveness))
 
 
 class FlatButton(tk.Label):
@@ -439,81 +372,6 @@ class FlatButton(tk.Label):
 
 # 맥에서는 배경색이 적용되는 FlatButton, 윈도우에서는 원래 tk.Button을 그대로 쓴다
 Button = FlatButton if IS_MAC else tk.Button
-
-
-class BackdropLabel(tk.Label):
-    """
-    배경 그림의 일부를 깔고, 그 위에 둥근 카드/칩까지 미리 합성해 보여주는 바탕 위젯.
-    위에 올릴 위젯은 카드와 같은 배경색(CARD_BG, CHIP_BG)을 쓰면 카드와 이어져 보인다.
-    shapes: {"x","y","w","h"}(이 위젯 기준 0~1 비율), "radius"(px), "fill", "shadow"
-    y_range: 전체 배경 그림에서 이 위젯이 차지하는 세로 구간 (윗줄 바와 본문이 하나의 배경처럼 이어지게)
-    """
-
-    def __init__(self, master, shapes=(), y_range=(0.0, 1.0), blur=False, **kw):
-        super().__init__(master, bd=0, highlightthickness=0, **kw)
-        self.shapes = list(shapes)
-        self.y_range = y_range
-        self.blur = blur
-        self._photo = None
-        self._size = None
-        self.bind("<Configure>", self._on_configure)
-
-    def set_shapes(self, shapes):
-        self.shapes = list(shapes)
-        self._size = None
-        self._render()
-
-    def _on_configure(self, _event=None):
-        self._render()
-
-    def _render(self):
-        w, h = self.winfo_width(), self.winfo_height()
-        if w <= 1 or h <= 1 or (w, h) == self._size:
-            return
-        self._size = (w, h)
-
-        span = max(1e-6, self.y_range[1] - self.y_range[0])
-        full_h = max(h, int(round(h / span)))
-        base = background_image(w, full_h, blur=self.blur)
-        top = int(round(full_h * self.y_range[0]))
-        img = base.crop((0, top, w, min(full_h, top + h))).copy()
-        if img.height < h:  # 창을 세로로 늘렸을 때 모자라는 만큼 채운다
-            img = img.resize((w, h))
-
-        for shape in self.shapes:
-            paste_card(
-                img,
-                (shape["x"] * w, shape["y"] * h, shape["w"] * w, shape["h"] * h),
-                radius=shape.get("radius", px(CARD_RADIUS)),
-                fill=shape.get("fill", CARD_BG),
-                shadow=shape.get("shadow", True),
-            )
-
-        self._photo = ImageTk.PhotoImage(img)
-        self.config(image=self._photo)
-
-
-class PillButton(tk.Label):
-    """둥근 그라데이션 버튼. 카드 위에 올리려고 이미지로 그려서 모서리를 둥글게 만든다."""
-
-    def __init__(self, master, text, command, width, height, font_size=14, bg=CARD_BG,
-                 top_color=ACCENT_TOP, bottom_color=ACCENT_BOTTOM,
-                 hover_top=ACCENT_TOP_HOVER, hover_bottom=ACCENT_BOTTOM_HOVER, text_color="#FFFFFF"):
-        super().__init__(master, bd=0, highlightthickness=0, bg=bg, cursor="hand2")
-        self._command = command
-        self._normal = ImageTk.PhotoImage(pill_image(width, height, text, font_size, top_color, bottom_color, text_color))
-        self._hover = ImageTk.PhotoImage(pill_image(width, height, text, font_size, hover_top, hover_bottom, text_color))
-        self.config(image=self._normal)
-        self.bind("<Enter>", lambda e: self.config(image=self._hover))
-        self.bind("<Leave>", lambda e: self.config(image=self._normal))
-        self.bind("<ButtonRelease-1>", self._on_click)
-
-    def _on_click(self, _event=None):
-        if self._command:
-            self._command()
-
-    def invoke(self):
-        self._on_click()
 
 
 def px(value):
@@ -627,173 +485,6 @@ def get_korean_font(size=18):
 
     _KOREAN_FONT_CACHE[size] = font
     return font
-
-
-# ==========================================
-# 0-3. 화면 디자인 (The Eclipse 테마)
-# ==========================================
-# Tk는 투명 위젯을 못 만든다. 그래서 배경 그림 위에 '둥근 카드'까지 미리 합성한 이미지를 한 장 만들어
-# 바탕으로 깔고, 그 위에 카드와 같은 단색 배경을 가진 위젯만 올린다. 이렇게 하면 둥근 모서리와
-# 그림자가 있는 카드 UI를 평범한 Tk 위젯으로 만들 수 있다.
-def _load_background_photo():
-    """assets/background.png(배경 사진)을 한 번만 읽어 둔다. 없으면 None."""
-    global _BG_PHOTO
-    if _BG_PHOTO is _BG_PHOTO_UNSET:
-        path = os.path.join(RESOURCE_DIR, "assets", "background.png")
-        try:
-            _BG_PHOTO = Image.open(path).convert("RGB")
-        except Exception:
-            _BG_PHOTO = None  # 파일이 없으면 코드로 그린 배경을 쓴다
-    return _BG_PHOTO
-
-
-def _hex_rgb(value):
-    value = value.lstrip("#")
-    return tuple(int(value[i:i + 2], 16) for i in (0, 2, 4))
-
-
-def background_image(width, height, blur=False):
-    """
-    배경 그림. assets/background.png(도시 야경 시안)이 있으면 그걸 화면 크기에 맞춰 쓰고,
-    없으면 아래에서 일식 느낌의 그림을 직접 그린다.
-    blur=True면 흐리고 어둡게 — 메인 화면이 아닌 곳(카메라·관리자 화면)에서 글자가 잘 보이게 한다.
-    """
-    key = (width, height, blur)
-    if key in _BG_CACHE:
-        return _BG_CACHE[key]
-
-    w, h = max(1, width), max(1, height)
-
-    photo = _load_background_photo()
-    if photo is not None:
-        # 비율을 맞추려고 잘라내면 사진 속 카드 위치가 밀려서, 화면 크기에 그대로 늘려 쓴다
-        # (가로세로 비가 조금 달라도 배경 사진이라 티가 나지 않는다)
-        img = photo.resize((w, h), Image.LANCZOS)
-        if blur:
-            img = img.filter(ImageFilter.GaussianBlur(max(6, min(w, h) * 0.02)))
-            img = Image.blend(img, Image.new("RGB", (w, h), (10, 22, 44)), 0.45)
-        _BG_CACHE.clear()
-        _BG_CACHE[key] = img
-        return img
-
-    ys = np.linspace(0.0, 1.0, h)[:, None]
-    xs = np.linspace(0.0, 1.0, w)[None, :]
-
-    # 위에서 아래로 남색 → 푸른빛 → 새벽빛 3단 그라데이션
-    stops = [(0.0, (9, 21, 46)), (0.45, (31, 62, 104)), (0.78, (105, 134, 164)), (1.0, (214, 188, 173))]
-    canvas = np.zeros((h, w, 3), dtype=np.float32)
-    for (p0, c0), (p1, c1) in zip(stops, stops[1:]):
-        band = np.clip((ys - p0) / max(1e-6, p1 - p0), 0.0, 1.0)[..., None]      # (h, 1, 1)
-        mask = ((ys >= p0) & (ys <= p1)).astype(np.float32)[..., None]
-        color = np.array(c0, dtype=np.float32) * (1 - band) + np.array(c1, dtype=np.float32) * band
-        canvas += mask * color
-
-    # 오른쪽 위로 갈수록 살짝 밝게 (빛이 드는 방향)
-    canvas *= (0.92 + 0.16 * xs)[..., None]
-
-    # 일식 고리 — 어두운 원 둘레에 밝은 테두리
-    cx, cy, r = 0.63 * w, 0.20 * h, 0.30 * min(w, h)
-    yy = np.arange(h)[:, None].astype(np.float32)
-    xx = np.arange(w)[None, :].astype(np.float32)
-    dist = np.sqrt((xx - cx) ** 2 + (yy - cy) ** 2)
-    ring = np.exp(-((dist - r) / (0.045 * min(w, h))) ** 2)
-    canvas += ring[..., None] * np.array([120.0, 160.0, 200.0])
-    glow = np.exp(-((dist - r) / (0.33 * min(w, h))) ** 2) * 0.35
-    canvas += glow[..., None] * np.array([60.0, 90.0, 130.0])
-    canvas -= (dist < r)[..., None] * np.array([18.0, 26.0, 36.0])
-
-    img = Image.fromarray(np.clip(canvas, 0, 255).astype(np.uint8), "RGB")
-
-    # 은은한 점(보케)과 얇은 원 — 너무 밋밋해 보이지 않게
-    overlay = Image.new("RGBA", (w, h), (0, 0, 0, 0))
-    draw = ImageDraw.Draw(overlay)
-    rng = random.Random(7)
-    for _ in range(90):
-        px_, py_ = rng.uniform(0, w), rng.uniform(0, h * 0.8)
-        rad = rng.uniform(1.0, 3.2)
-        alpha = int(rng.uniform(30, 110))
-        draw.ellipse([px_ - rad, py_ - rad, px_ + rad, py_ + rad], fill=(222, 236, 252, alpha))
-    for scale, alpha in ((1.35, 26), (1.75, 18)):
-        rr = r * scale
-        draw.ellipse([cx - rr, cy - rr, cx + rr, cy + rr], outline=(170, 200, 235, alpha), width=max(1, int(h * 0.002)))
-    img = Image.alpha_composite(img.convert("RGBA"), overlay).convert("RGB")
-
-    if blur:
-        img = img.filter(ImageFilter.GaussianBlur(max(6, min(w, h) * 0.02)))
-        img = Image.blend(img, Image.new("RGB", (w, h), (10, 22, 44)), 0.45)
-
-    _BG_CACHE.clear()  # 창 크기는 보통 한 가지뿐이라 캐시는 1장만 들고 있는다
-    _BG_CACHE[key] = img
-    return img
-
-
-def paste_card(base, box, radius, fill=CARD_BG, shadow=True):
-    """배경 그림 위에 둥근 사각형 카드를 (그림자와 함께) 합성한다. box = (x, y, w, h) 픽셀."""
-    x, y, w, h = (int(round(v)) for v in box)
-    if w <= 0 or h <= 0:
-        return
-
-    if shadow:
-        pad = max(8, radius)
-        shadow_img = Image.new("RGBA", (w + pad * 4, h + pad * 4), (0, 0, 0, 0))
-        ImageDraw.Draw(shadow_img).rounded_rectangle(
-            [pad * 2, pad * 2 + pad // 2, pad * 2 + w, pad * 2 + h + pad // 2],
-            radius=radius, fill=(14, 28, 50, 90)
-        )
-        shadow_img = shadow_img.filter(ImageFilter.GaussianBlur(pad * 0.7))
-        base.paste(Image.alpha_composite(
-            base.crop((x - pad * 2, y - pad * 2, x - pad * 2 + shadow_img.width, y - pad * 2 + shadow_img.height)).convert("RGBA"),
-            shadow_img
-        ).convert("RGB"), (x - pad * 2, y - pad * 2))
-
-    card = Image.new("RGBA", (w, h), (0, 0, 0, 0))
-    ImageDraw.Draw(card).rounded_rectangle([0, 0, w - 1, h - 1], radius=radius, fill=_hex_rgb(fill) + (255,))
-    base.paste(Image.alpha_composite(base.crop((x, y, x + w, y + h)).convert("RGBA"), card).convert("RGB"), (x, y))
-
-
-def pill_image(width, height, text, font_size, top_color, bottom_color, text_color="#FFFFFF"):
-    """세로 그라데이션이 들어간 둥근 버튼 그림 (알약 모양)."""
-    key = (width, height, text, font_size, top_color, bottom_color, text_color)
-    if key in _PILL_CACHE:
-        return _PILL_CACHE[key]
-
-    w, h = max(1, width), max(1, height)
-    top, bottom = np.array(_hex_rgb(top_color), dtype=np.float32), np.array(_hex_rgb(bottom_color), dtype=np.float32)
-    ramp = np.linspace(0.0, 1.0, h)[:, None, None]
-    body = Image.fromarray(np.clip(top * (1 - ramp) + bottom * ramp, 0, 255).astype(np.uint8).repeat(w, axis=1), "RGB")
-
-    mask = Image.new("L", (w, h), 0)
-    ImageDraw.Draw(mask).rounded_rectangle([0, 0, w - 1, h - 1], radius=h // 2, fill=255)
-    img = Image.new("RGBA", (w, h), (0, 0, 0, 0))
-    img.paste(body, (0, 0), mask)
-
-    draw = ImageDraw.Draw(img)
-    draw.rounded_rectangle([0, 0, w - 1, h - 1], radius=h // 2, outline=(255, 255, 255, 110), width=1)
-    font = get_korean_font(font_size)
-    left, top_, right, bottom_ = draw.textbbox((0, 0), text, font=font)
-    draw.text(((w - (right - left)) / 2 - left, (h - (bottom_ - top_)) / 2 - top_), text,
-              font=font, fill=_hex_rgb(text_color) + (255,))
-
-    _PILL_CACHE[key] = img
-    return img
-
-
-def face_icon_image(size, color="#6E9BC5", bg=CARD_BG):
-    """메인 화면 왼쪽 카드의 사람 얼굴 선 아이콘."""
-    img = Image.new("RGB", (size, size), _hex_rgb(bg))
-    # 아이콘 뒤의 은은한 원 (그라데이션 없이 아주 옅은 색이라 카드와 자연스럽게 섞인다)
-    halo = Image.new("RGB", (size, size), _hex_rgb("#EDF4FB"))
-    mask = Image.new("L", (size, size), 0)
-    ImageDraw.Draw(mask).ellipse([size * 0.09, size * 0.06, size * 0.91, size * 0.88], fill=255)
-    img.paste(halo, (0, 0), mask.filter(ImageFilter.GaussianBlur(size * 0.02)))
-
-    draw = ImageDraw.Draw(img)
-    line = max(2, int(size * 0.022))
-    draw.ellipse([size * 0.30, size * 0.10, size * 0.70, size * 0.52], outline=_hex_rgb(color), width=line)
-    draw.arc([size * 0.16, size * 0.52, size * 0.84, size * 1.16], start=200, end=340,
-             fill=_hex_rgb(color), width=line)
-    return img
-
 
 # ==========================================
 # 0. 창공시스템(SeatManagerApp, C#) 연동
@@ -1266,7 +957,7 @@ class DatePicker(Button):
 
     def __init__(self, master, initial, on_change=None):
         super().__init__(
-            master, bg=CARD_BG, fg=TEXT_MAIN, activebackground="#F1F5F9", relief=tk.SOLID, bd=1,
+            master, bg="white", fg="#0F172A", activebackground="#F1F5F9", relief=tk.SOLID, bd=1,
             font=(UI_FONT, 10), padx=px(8), pady=px(2), cursor="hand2", command=self.toggle_calendar
         )
         self.on_change = on_change
@@ -1287,8 +978,8 @@ class DatePicker(Button):
 
         self.popup = tk.Toplevel(self)
         self.popup.overrideredirect(True)
-        self.popup.configure(bg="#C7D9EA")  # 바깥 1px 테두리
-        self.body = tk.Frame(self.popup, bg=CARD_BG)
+        self.popup.configure(bg="#CBD5E1")  # 바깥 1px 테두리
+        self.body = tk.Frame(self.popup, bg="white")
         self.body.pack(padx=1, pady=1)
 
         self._view_year, self._view_month = self._date.year, self._date.month
@@ -1340,18 +1031,18 @@ class DatePicker(Button):
         for widget in self.body.winfo_children():
             widget.destroy()
 
-        header = tk.Frame(self.body, bg=CARD_BG)
+        header = tk.Frame(self.body, bg="white")
         header.grid(row=0, column=0, columnspan=7, sticky=tk.EW, pady=(px(6), px(4)))
-        nav_style = dict(bg=CARD_BG, fg="#3A5C7D", activebackground="#DCE7F2", bd=0,
+        nav_style = dict(bg="white", fg="#334155", activebackground="#E2E8F0", bd=0,
                          font=(UI_FONT, 11, "bold"), cursor="hand2", padx=px(8))
         Button(header, text="◀", command=lambda: self._shift_month(-1), **nav_style).pack(side=tk.LEFT, padx=px(4))
         Button(header, text="▶", command=lambda: self._shift_month(1), **nav_style).pack(side=tk.RIGHT, padx=px(4))
-        tk.Label(header, text=f"{self._view_year}년 {self._view_month}월", bg=CARD_BG, fg=TEXT_MAIN,
+        tk.Label(header, text=f"{self._view_year}년 {self._view_month}월", bg="white", fg="#0F172A",
                  font=(UI_FONT, 11, "bold")).pack(side=tk.LEFT, expand=True)
 
         for col, name in enumerate(WEEKDAY_KO):
-            color = "#D4696B" if col == 6 else "#4A8CCB" if col == 5 else "#64748B"
-            tk.Label(self.body, text=name, bg=CARD_BG, fg=color, width=4,
+            color = "#EF4444" if col == 6 else "#3B82F6" if col == 5 else "#64748B"
+            tk.Label(self.body, text=name, bg="white", fg=color, width=4,
                      font=(UI_FONT, 9, "bold")).grid(row=1, column=col, pady=(0, px(2)))
 
         today = date.today()
@@ -1361,12 +1052,12 @@ class DatePicker(Button):
                 selected = day == self._date
                 is_today = day == today
                 if selected:
-                    bg, fg = "#4A8CCB", "white"
+                    bg, fg = "#3B82F6", "white"
                 elif day.month != self._view_month:
-                    bg, fg = "white", "#C7D9EA"
+                    bg, fg = "white", "#CBD5E1"
                 else:
                     bg = "#DBEAFE" if is_today else "white"
-                    fg = "#D4696B" if col == 6 else "#4A8CCB" if col == 5 else "#0F172A"
+                    fg = "#EF4444" if col == 6 else "#3B82F6" if col == 5 else "#0F172A"
                 Button(
                     self.body, text=str(day.day), width=4, bg=bg, fg=fg, bd=0, relief=tk.FLAT,
                     activebackground="#BFDBFE", cursor="hand2",
@@ -1375,8 +1066,8 @@ class DatePicker(Button):
                 ).grid(row=row, column=col, padx=1, pady=1)
 
         Button(
-            self.body, text=f"오늘 ({format_date_ko(today)})", bg=CARD_BG, fg="#3A5C7D", bd=0,
-            activebackground="#DCE7F2", font=(UI_FONT, 9, "bold"), cursor="hand2",
+            self.body, text=f"오늘 ({format_date_ko(today)})", bg="#F1F5F9", fg="#334155", bd=0,
+            activebackground="#E2E8F0", font=(UI_FONT, 9, "bold"), cursor="hand2",
             command=lambda: self._pick(today)
         ).grid(row=len(weeks) + 2, column=0, columnspan=7, sticky=tk.EW, padx=px(6), pady=px(6))
 
@@ -1394,7 +1085,7 @@ LOG_FILTER_MODES = [
 LOG_SUMMARY_MODES = {"recent7_sum", "week_days", "week_hours"}
 
 ACTION_LABELS = {"CHECK_IN": "출근", "CHECK_OUT": "퇴근"}
-ACTION_COLORS = {"CHECK_IN": ("#3E9B7A", "#34886A"), "CHECK_OUT": ("#4A8CCB", "#3C7AB5")}
+ACTION_COLORS = {"CHECK_IN": ("#10B981", "#059669"), "CHECK_OUT": ("#3B82F6", "#2563EB")}
 
 
 def center_on(window, popup, rel_y=0.4):
@@ -1412,34 +1103,34 @@ class AdminLoginDialog(tk.Toplevel):
         super().__init__(app.window)
         self.app = app
         self.title("관리자 로그인")
-        self.configure(bg=CARD_BG)
+        self.configure(bg=PANEL)
         self.resizable(False, False)
         self.transient(app.window)
 
-        body = tk.Frame(self, bg=CARD_BG)
+        body = tk.Frame(self, bg=PANEL)
         body.pack(padx=px(40), pady=px(32))
 
-        tk.Label(body, text="관리자 로그인", font=(UI_FONT, 18, "bold"), bg=CARD_BG, fg=TEXT_MAIN) \
+        tk.Label(body, text="관리자 로그인", font=(UI_FONT, 18, "bold"), bg=PANEL, fg=TEXT) \
             .pack(anchor=tk.W, pady=(0, px(20)))
 
-        tk.Label(body, text="아이디", font=(UI_FONT, 10, "bold"), bg=CARD_BG, fg=TEXT_SUB).pack(anchor=tk.W)
+        tk.Label(body, text="아이디", font=(UI_FONT, 10, "bold"), bg=PANEL, fg=MUTED).pack(anchor=tk.W)
         self.ent_id = ttk.Entry(body, font=(UI_FONT, 12), width=28)
         self.ent_id.pack(fill=tk.X, ipady=4, pady=(px(4), px(14)))
 
-        tk.Label(body, text="비밀번호", font=(UI_FONT, 10, "bold"), bg=CARD_BG, fg=TEXT_SUB).pack(anchor=tk.W)
+        tk.Label(body, text="비밀번호", font=(UI_FONT, 10, "bold"), bg=PANEL, fg=MUTED).pack(anchor=tk.W)
         self.ent_pwd = ttk.Entry(body, font=(UI_FONT, 12), width=28, show="*")
         self.ent_pwd.pack(fill=tk.X, ipady=4, pady=(px(4), px(22)))
 
-        btn_row = tk.Frame(body, bg=CARD_BG)
+        btn_row = tk.Frame(body, bg=PANEL)
         btn_row.pack(fill=tk.X)
         Button(
-            btn_row, text="취소", bg="#DCE7F2", fg="#3A5C7D", bd=0,
-            activebackground="#C7D9EA", activeforeground="#1E293B",
+            btn_row, text="취소", bg=BLUE_SOFT, fg=BLUE, bd=0,
+            activebackground=BLUE_SOFT_HOVER, activeforeground=BLUE,
             font=(UI_FONT, 12, "bold"), height=2, cursor="hand2", command=self.destroy
         ).pack(side=tk.LEFT, expand=True, fill=tk.X, padx=(0, px(6)))
         Button(
-            btn_row, text="로그인", bg="#4A8CCB", fg="white", bd=0,
-            activebackground="#3C7AB5", activeforeground="white",
+            btn_row, text="로그인", bg=BLUE, fg="white", bd=0,
+            activebackground=BLUE_DARK, activeforeground="white",
             font=(UI_FONT, 12, "bold"), height=2, cursor="hand2", command=self.try_login
         ).pack(side=tk.LEFT, expand=True, fill=tk.X, padx=(px(6), 0))
 
@@ -1484,6 +1175,375 @@ class AdminLoginDialog(tk.Toplevel):
         self.app.set_admin_logged_in(True, user_id)
 
 
+# ==========================================
+# 2-1. 디자인 — 탁한 흰색 + 파란색 두 가지 색만 쓴다
+# ==========================================
+BG = "#EFEEEA"              # 앱 바탕 (탁한 흰색)
+PANEL = "#FAF9F6"           # 카드
+PANEL_ALT = "#F2F1ED"       # 카드 안의 보조 영역
+LINE = "#DEDCD5"            # 테두리
+TEXT = "#1A2233"
+TEXT_SUB = "#4A5262"
+MUTED = "#8A8F99"
+BLUE = "#1F4FBF"
+BLUE_DARK = "#173C96"
+BLUE_SOFT = "#E3E9F6"
+BLUE_SOFT_HOVER = "#D3DDF2"
+BLUE_LINE = "#C3D0EC"
+CAM_BG = "#111B30"          # 카메라 영상 뒤 배경
+# 상태 표시에만 쓰는 색 (카메라 상자 색과 맞춘다)
+OK = "#16A34A"
+WARN = "#B26A00"
+ERR = "#C2362B"
+
+VERIFY_CARD_SIZE = (1160, 640)   # 출근/퇴근/출석 조회 확인 카드 (1600x900 기준)
+RESULT_CARD_SIZE = (760, 500)
+STATS_CARD_SIZE = (1160, 740)
+TEST_PANEL_WIDTH = 510           # 카메라 테스트 오른쪽 안내 패널 — 카메라가 화면의 약 2/3를 쓴다
+
+
+def _hex_rgb(color):
+    color = color.lstrip("#")
+    return tuple(int(color[i:i + 2], 16) for i in (0, 2, 4))
+
+
+_render_cache = {}
+
+
+def _cached(key, make):
+    """같은 모양을 다시 그리지 않도록 PIL 이미지를 기억해 둔다 (창 크기 변경 때만 새로 그린다)."""
+    img = _render_cache.get(key)
+    if img is None:
+        if len(_render_cache) > 256:
+            _render_cache.clear()
+        img = _render_cache[key] = make()
+    return img
+
+
+def render_round_rect(w, h, radius, fill, bg=None, outline=None, outline_width=1, shadow=0):
+    """
+    둥근 사각형 그림. Tk 캔버스는 곡선을 부드럽게(안티에일리어싱) 그리지 못해서
+    PIL로 크게 그린 뒤 줄여서 가장자리를 매끄럽게 만든다.
+    bg=None이면 모서리 바깥이 투명하다. shadow>0이면 그만큼 바깥 여백에 은은한 그림자를 깐다.
+    """
+    w, h = max(2, int(w)), max(2, int(h))
+    radius = max(0, min(int(radius), (w - 2 * shadow) // 2, (h - 2 * shadow) // 2))
+    key = ("rr", w, h, radius, fill, bg, outline, outline_width, shadow)
+
+    def make():
+        base = Image.new("RGBA", (w, h), (_hex_rgb(bg) + (255,)) if bg else (0, 0, 0, 0))
+        if shadow:
+            mask = Image.new("L", (w, h), 0)
+            ImageDraw.Draw(mask).rounded_rectangle(
+                (shadow, shadow + shadow // 3, w - shadow, h - shadow + shadow // 3), radius, fill=34)
+            mask = mask.filter(ImageFilter.GaussianBlur(shadow / 2))
+            tint = Image.new("RGBA", (w, h), (23, 37, 84, 255))
+            tint.putalpha(mask)
+            base = Image.alpha_composite(base, tint)
+        s = 3 if w * h < 400_000 else 2
+        layer = Image.new("RGBA", (w * s, h * s), (0, 0, 0, 0))
+        box = (shadow * s, shadow * s, (w - shadow) * s - 1, (h - shadow) * s - 1)
+        ImageDraw.Draw(layer).rounded_rectangle(
+            box, radius * s, fill=_hex_rgb(fill) + (255,),
+            outline=(_hex_rgb(outline) + (255,)) if outline else None,
+            width=outline_width * s if outline else 0)
+        layer = layer.resize((w, h), Image.LANCZOS)
+        return Image.alpha_composite(base, layer)
+
+    return _cached(key, make)
+
+
+def render_circle(d, fill):
+    def make():
+        s = 4
+        img = Image.new("RGBA", (d * s, d * s), (0, 0, 0, 0))
+        ImageDraw.Draw(img).ellipse((0, 0, d * s - 1, d * s - 1), fill=_hex_rgb(fill) + (255,))
+        return img.resize((d, d), Image.LANCZOS)
+    return _cached(("circle", d, fill), make)
+
+
+def render_icon(kind, size, color):
+    """선 아이콘 (출근·퇴근·얼굴·안내·확인·시계·카메라 꺼짐·주의). 글꼴에 없는 기호를 쓰지 않으려고 직접 그린다."""
+    def make():
+        s = 4
+        S = size * s
+        img = Image.new("RGBA", (S, S), (0, 0, 0, 0))
+        d = ImageDraw.Draw(img)
+        rgb = _hex_rgb(color) + (255,)
+        lw = max(2, int(S * 0.09))
+
+        def P(x, y):
+            return (x * S, y * S)
+
+        def dot(x, y, r):
+            d.ellipse((x * S - r * S, y * S - r * S, x * S + r * S, y * S + r * S), fill=rgb)
+
+        def line(*pts):
+            pts = [P(*p) for p in pts]
+            d.line(pts, fill=rgb, width=lw, joint="curve")
+            r = lw / 2
+            for x, y in (pts[0], pts[-1]):
+                d.ellipse((x - r, y - r, x + r, y + r), fill=rgb)
+
+        def ring():
+            m = lw / 2 + S * 0.06
+            d.ellipse((m, m, S - m, S - m), outline=rgb, width=lw)
+
+        if kind == "in":
+            line((0.55, 0.14), (0.84, 0.14), (0.84, 0.86), (0.55, 0.86))
+            line((0.12, 0.5), (0.62, 0.5))
+            line((0.44, 0.32), (0.62, 0.5), (0.44, 0.68))
+        elif kind == "out":
+            line((0.45, 0.14), (0.16, 0.14), (0.16, 0.86), (0.45, 0.86))
+            line((0.38, 0.5), (0.88, 0.5))
+            line((0.70, 0.32), (0.88, 0.5), (0.70, 0.68))
+        elif kind == "face":
+            line((0.08, 0.30), (0.08, 0.08), (0.30, 0.08))
+            line((0.70, 0.08), (0.92, 0.08), (0.92, 0.30))
+            line((0.92, 0.70), (0.92, 0.92), (0.70, 0.92))
+            line((0.30, 0.92), (0.08, 0.92), (0.08, 0.70))
+            dot(0.36, 0.42, 0.055)
+            dot(0.64, 0.42, 0.055)
+            d.arc((*P(0.32, 0.40), *P(0.68, 0.72)), 25, 155, fill=rgb, width=lw)
+        elif kind == "info":
+            ring()
+            dot(0.5, 0.31, 0.06)
+            line((0.5, 0.48), (0.5, 0.72))
+        elif kind == "alert":
+            ring()
+            line((0.5, 0.28), (0.5, 0.55))
+            dot(0.5, 0.71, 0.06)
+        elif kind == "check":
+            line((0.18, 0.52), (0.42, 0.75), (0.84, 0.28))
+        elif kind == "clock":
+            ring()
+            line((0.5, 0.28), (0.5, 0.5), (0.68, 0.62))
+        elif kind == "camera_off":
+            line((0.10, 0.30), (0.66, 0.30), (0.66, 0.76), (0.10, 0.76), (0.10, 0.30))
+            line((0.66, 0.46), (0.92, 0.32), (0.92, 0.74), (0.66, 0.60))
+            line((0.10, 0.10), (0.90, 0.92))
+        return img.resize((size, size), Image.LANCZOS)
+
+    return _cached(("icon", kind, size, color), make)
+
+
+def render_ring(size, width, track, color=None, start=0, extent=360, bg=PANEL):
+    """상태 표시용 원형 링. extent<360이면 끝이 둥근 호(돌아가는 로딩 표시)를 그린다."""
+    def make():
+        s = 3
+        S = size * s
+        img = Image.new("RGB", (S, S), _hex_rgb(bg))
+        d = ImageDraw.Draw(img)
+        m = s * 2
+        box = (m, m, S - m, S - m)
+        d.ellipse(box, outline=_hex_rgb(track), width=width * s)
+        if color:
+            rgb = _hex_rgb(color)
+            if extent >= 360:
+                d.ellipse(box, outline=rgb, width=width * s)
+            else:
+                d.arc(box, start, start + extent, fill=rgb, width=width * s)
+                c = S / 2
+                r_mid = (S - 2 * m) / 2 - width * s / 2
+                cap = width * s / 2
+                for a in (start, start + extent):
+                    x = c + r_mid * math.cos(math.radians(a))
+                    y = c + r_mid * math.sin(math.radians(a))
+                    d.ellipse((x - cap, y - cap, x + cap, y + cap), fill=rgb)
+        return img.resize((size, size), Image.LANCZOS)
+
+    return _cached(("ring", size, width, track, color, start, extent, bg), make)
+
+
+def compose_center(base, icon):
+    """base 그림 가운데에 icon을 얹는다 (로고 타일 등)."""
+    out = base.copy()
+    out.alpha_composite(icon, ((base.width - icon.width) // 2, (base.height - icon.height) // 2))
+    return out
+
+
+class RoundedPanel(tk.Canvas):
+    """모서리가 둥근 카드 (배치된 크기를 그대로 채운다). 안쪽 내용은 .body(Frame)에 넣는다."""
+
+    def __init__(self, master, fill=PANEL, bg=BG, radius=None, outline=LINE, shadow=0, pad=None,
+                 width=None, height=None):
+        super().__init__(master, bg=bg, highlightthickness=0, bd=0, width=width or 1, height=height or 1)
+        self.fill, self._bg, self.outline, self.shadow = fill, bg, outline, shadow
+        self.radius = px(16) if radius is None else radius
+        self.inset = shadow + (px(20) if pad is None else pad)
+        self._photo = None
+        self._img_item = self.create_image(0, 0, anchor=tk.NW)
+        self.body = tk.Frame(self, bg=fill)
+        self._win = self.create_window(self.inset, self.inset, window=self.body, anchor=tk.NW)
+        self.bind("<Configure>", self._on_configure)
+
+    def _on_configure(self, event):
+        img = render_round_rect(event.width, event.height, self.radius, self.fill, self._bg,
+                                self.outline, shadow=self.shadow)
+        self._photo = ImageTk.PhotoImage(img)
+        self.itemconfig(self._img_item, image=self._photo)
+        self.itemconfig(self._win, width=max(1, event.width - 2 * self.inset),
+                        height=max(1, event.height - 2 * self.inset))
+
+
+class RoundedBox(tk.Frame):
+    """
+    높이가 내용에 맞춰지는 둥근 상자. 일반 pack 배치로 크기가 정해지고,
+    둥근 배경 그림은 뒤에 깔린 라벨이 크기에 맞춰 다시 그린다.
+    """
+
+    def __init__(self, master, fill=PANEL_ALT, bg=PANEL, radius=None, pad=None, outline=None):
+        super().__init__(master, bg=bg)
+        self.fill, self._bg, self.outline = fill, bg, outline
+        self.radius = px(12) if radius is None else radius
+        self._photo = None
+        self._bg_label = tk.Label(self, bg=bg, bd=0)
+        self._bg_label.place(x=0, y=0, relwidth=1, relheight=1)
+        self.body = tk.Frame(self, bg=fill)
+        pad = px(16) if pad is None else pad
+        self.body.pack(fill=tk.BOTH, expand=True, padx=pad, pady=pad)
+        self.bind("<Configure>", self._redraw)
+
+    def _redraw(self, event):
+        self._photo = ImageTk.PhotoImage(
+            render_round_rect(event.width, event.height, self.radius, self.fill, self._bg, self.outline))
+        self._bg_label.config(image=self._photo)
+
+
+class RoundButton(tk.Canvas):
+    """둥근 버튼. command가 없으면 글자 표시용 알약(pill)으로도 쓴다."""
+
+    def __init__(self, master, text="", command=None, width=None, height=None, font=None, radius=None,
+                 fill=BLUE, hover=BLUE_DARK, fg="white", hover_fg=None, outline=None, bg=PANEL,
+                 padx=None, icon=None):
+        self._font = font or (UI_FONT, 12, "bold")
+        self._padx = px(22) if padx is None else padx
+        self._icon = ImageTk.PhotoImage(icon) if icon is not None else None
+        self._fixed_width = width
+        height = height or px(48)
+        self._bw, self._bh = (width or self._measure(text)), height
+        super().__init__(master, width=self._bw, height=height, bg=bg, highlightthickness=0, bd=0,
+                         cursor="hand2" if command else "")
+        self._bg = bg
+        self.radius = px(10) if radius is None else radius
+        self.command = command
+        self._hovering = False
+        self._style = None
+        self._img_item = self.create_image(0, 0, anchor=tk.NW)
+        self._icon_item = self.create_image(0, 0, anchor=tk.W)
+        self._text_item = self.create_text(0, 0, text=text, font=self._font, anchor=tk.W)
+        self._text = text
+        self.set_style(fill, hover, fg, hover_fg, outline)
+        if command:
+            self.bind("<Enter>", self._on_enter)
+            self.bind("<Leave>", self._on_leave)
+            self.bind("<ButtonRelease-1>", self._on_click)
+
+    def _measure(self, text):
+        width = tkfont.Font(font=self._font).measure(text) + 2 * self._padx
+        if self._icon is not None:
+            width += self._icon.width() + px(10)
+        return width
+
+    def _layout(self):
+        text_w = tkfont.Font(font=self._font).measure(self._text)
+        icon_w = self._icon.width() + px(10) if self._icon is not None else 0
+        x = (self._bw - text_w - icon_w) // 2
+        if self._icon is not None:
+            self.itemconfig(self._icon_item, image=self._icon)
+            self.coords(self._icon_item, x, self._bh // 2)
+        self.coords(self._text_item, x + icon_w, self._bh // 2)
+
+    def set_style(self, fill, hover=None, fg="white", hover_fg=None, outline=None):
+        style = (fill, hover, fg, hover_fg, outline, self._bw)
+        if style == self._style:
+            return
+        self._style = style
+        self._fg, self._hover_fg = fg, hover_fg or fg
+        self._img_normal = ImageTk.PhotoImage(
+            render_round_rect(self._bw, self._bh, self.radius, fill, self._bg, outline))
+        self._img_hover = ImageTk.PhotoImage(
+            render_round_rect(self._bw, self._bh, self.radius, hover or fill, self._bg, outline))
+        self._apply()
+        self._layout()
+
+    def _apply(self):
+        self.itemconfig(self._img_item, image=self._img_hover if self._hovering else self._img_normal)
+        self.itemconfig(self._text_item, fill=self._hover_fg if self._hovering else self._fg)
+
+    def set_text(self, text):
+        if text == self._text:
+            return
+        self._text = text
+        self.itemconfig(self._text_item, text=text)
+        if self._fixed_width is None:
+            new_w = self._measure(text)
+            if new_w != self._bw:
+                self._bw = new_w
+                self.configure(width=new_w)
+                fill, hover, fg, hover_fg, outline, _ = self._style
+                self._style = None
+                self.set_style(fill, hover, fg, hover_fg, outline)
+                return
+        self._layout()
+
+    def _on_enter(self, _event=None):
+        self._hovering = True
+        self._apply()
+
+    def _on_leave(self, _event=None):
+        self._hovering = False
+        self._apply()
+
+    def _on_click(self, event):
+        if 0 <= event.x < self._bw and 0 <= event.y < self._bh and self.command:
+            self.command()
+
+
+class ProgressBar(tk.Canvas):
+    """얇은 둥근 진행 막대. marker를 주면 그 위치(0~1)에 기준선을 긋는다."""
+
+    def __init__(self, master, width, height, bg=PANEL, track=BLUE_SOFT, color=BLUE):
+        super().__init__(master, width=width, height=height, bg=bg, highlightthickness=0, bd=0)
+        self._bw, self._bh, self._bg, self._track, self._color = width, height, bg, track, color
+        self._key = None
+        self._item = self.create_image(0, 0, anchor=tk.NW)
+
+    def set(self, fraction, color=None, marker=None):
+        fraction = min(1.0, max(0.0, fraction))
+        color = color or self._color
+        key = (round(fraction * self._bw), color, marker)
+        if key == self._key:
+            return
+        self._key = key
+        w, h, s = self._bw, self._bh, 3
+        img = Image.new("RGB", (w * s, h * s), _hex_rgb(self._bg))
+        d = ImageDraw.Draw(img)
+        d.rounded_rectangle((0, 0, w * s - 1, h * s - 1), h * s // 2, fill=_hex_rgb(self._track))
+        if fraction > 0:
+            d.rounded_rectangle((0, 0, max(h * s, int(w * s * fraction)) - 1, h * s - 1), h * s // 2,
+                                fill=_hex_rgb(color))
+        if marker is not None:
+            mx = int(w * s * marker)
+            d.rectangle((mx - s, 0, mx + s, h * s), fill=_hex_rgb(TEXT))
+        self._photo = ImageTk.PhotoImage(img.resize((w, h), Image.LANCZOS))
+        self.itemconfig(self._item, image=self._photo)
+
+
+def make_pill(master, text, bg=PANEL, fill=BLUE_SOFT, fg=BLUE, font_size=10):
+    """상태를 알려주는 작은 알약 모양 표시."""
+    h = px(34)
+    return RoundButton(master, text=text, height=h, radius=h // 2, fill=fill, fg=fg, bg=bg,
+                       font=(UI_FONT, font_size, "bold"), padx=px(16))
+
+
+def icon_label(master, kind, size, color, bg):
+    photo = ImageTk.PhotoImage(render_icon(kind, size, color))
+    lbl = tk.Label(master, image=photo, bg=bg, bd=0)
+    lbl.image = photo  # 참조를 들고 있어야 그림이 사라지지 않는다
+    return lbl
+
+
 _blink_hint_frames_cache = {}
 
 
@@ -1497,10 +1557,17 @@ def _get_blink_hint_frames(size):
     frames = []
     if os.path.exists(BLINK_HINT_IMAGE_PATH):
         try:
+            # 네모난 이미지의 모서리가 바깥 링 위로 튀어나오지 않게 동그랗게 잘라낸다 (가장자리는 부드럽게)
+            s = 4
+            mask = Image.new("L", (size * s, size * s), 0)
+            ImageDraw.Draw(mask).ellipse((0, 0, size * s - 1, size * s - 1), fill=255)
+            mask = mask.resize((size, size), Image.LANCZOS)
             src = Image.open(BLINK_HINT_IMAGE_PATH)
             for frame in ImageSequence.Iterator(src):
                 duration = frame.info.get("duration", 100) or 100
                 resized = frame.convert("RGBA").resize((size, size), Image.LANCZOS)
+                alpha = Image.composite(resized.getchannel("A"), Image.new("L", (size, size), 0), mask)
+                resized.putalpha(alpha)
                 frames.append((ImageTk.PhotoImage(resized), duration))
         except Exception as e:
             print(f"[출석] 눈 깜빡임 안내 이미지를 불러오지 못했습니다 ({e})")
@@ -1509,207 +1576,374 @@ def _get_blink_hint_frames(size):
     return frames
 
 
-class SessionCard(tk.Frame):
-    """카메라가 켜진 동안 오른쪽에 뜨는 안내 카드의 공통 틀 (제목 · 안내 · 상태 · 남은 시간 · 닫기 버튼)."""
+class StatusVisual(tk.Canvas):
+    """
+    얼굴 확인 상태를 보여주는 원형 표시.
+      search : 링이 돌아간다 (얼굴을 찾는 중)
+      face   : 학생을 찾았을 때 — 눈을 깜빡이는 얼굴 GIF
+      done / warn / error : 완료 체크 · 주의 표시
+    """
+    SPIN_FRAMES = 30
 
-    def __init__(self, app, title, color, subtitle, lines, close_text, master=None):
-        # 테두리는 그리지 않는다 — 뒤에 깔린 둥근 카드(BackdropLabel)가 테두리 역할을 한다
-        super().__init__(master or app.right_container, bg=CARD_BG, bd=0)
+    def __init__(self, master, size, bg=PANEL):
+        super().__init__(master, width=size, height=size, bg=bg, highlightthickness=0, bd=0)
+        self.size = size
+        ring_w = max(4, size // 30)
+        c = size // 2
+        self._spin = [ImageTk.PhotoImage(render_ring(size, ring_w, BLUE_SOFT, BLUE,
+                                                     start=i * 360 // self.SPIN_FRAMES - 90, extent=100, bg=bg))
+                      for i in range(self.SPIN_FRAMES)]
+        self._rings = {
+            "track": ImageTk.PhotoImage(render_ring(size, ring_w, BLUE_SOFT, bg=bg)),
+            "blue": ImageTk.PhotoImage(render_ring(size, ring_w, BLUE_SOFT, BLUE, bg=bg)),
+            "warn": ImageTk.PhotoImage(render_ring(size, ring_w, BLUE_SOFT, WARN, bg=bg)),
+            "error": ImageTk.PhotoImage(render_ring(size, ring_w, BLUE_SOFT, ERR, bg=bg)),
+        }
+        icon_size = int(size * 0.4)
+        self._icons = {
+            "search": ImageTk.PhotoImage(render_icon("face", icon_size, BLUE_LINE)),
+            "done": ImageTk.PhotoImage(render_icon("check", icon_size, BLUE)),
+            "warn": ImageTk.PhotoImage(render_icon("alert", icon_size, WARN)),
+            "error": ImageTk.PhotoImage(render_icon("alert", icon_size, ERR)),
+        }
+        self._gif = _get_blink_hint_frames(int(size * 0.68))
+        self._ring_item = self.create_image(c, c)
+        self._center_item = self.create_image(c, c)
+        self._mode = None
+        self._job = None
+        self._idx = 0
+        self.bind("<Destroy>", lambda e: self._cancel() if e.widget is self else None)
 
-        inner = tk.Frame(self, bg=CARD_BG)
-        inner.pack(padx=px(40), pady=px(44), fill=tk.BOTH, expand=True)
+    def _cancel(self):
+        if self._job is not None:
+            self.after_cancel(self._job)
+            self._job = None
 
-        tk.Label(inner, text=title, font=(UI_FONT, 30, "bold"), bg=CARD_BG, fg=color).pack(anchor=tk.W)
-        tk.Label(inner, text=subtitle, font=(UI_FONT, 17, "bold"),
-                 bg=CARD_BG, fg=TEXT_MAIN).pack(anchor=tk.W, pady=(px(6), px(28)))
-
-        for line in lines:
-            tk.Label(inner, text=line, font=(UI_FONT, 12), bg=CARD_BG, fg="#3A5C7D",
-                     justify=tk.LEFT, wraplength=px(RIGHT_PANEL_WIDTH - 140)).pack(anchor=tk.W, pady=px(4))
-
-        self.lbl_status = tk.Label(inner, text="", font=(UI_FONT, 13, "bold"), bg=CARD_BG, fg="#44658A",
-                                   padx=px(14), pady=px(12), anchor=tk.W, justify=tk.LEFT,
-                                   wraplength=px(RIGHT_PANEL_WIDTH - 140))
-        self.lbl_status.pack(fill=tk.X, pady=(px(28), 0))
-
-        # 눈을 깜빡이라는 문구만으로는 잘 와닿지 않아서, 깜빡이는 모습을 보여주는 이미지를
-        # 그 순간에만 카드 오른쪽 위 모서리에 띄운다. 이미지가 없으면 만들지 않는다.
-        # place()로 self(카드 전체) 기준 오른쪽 위에 고정하면, inner의 pack 흐름과 상관없이
-        # 항상 같은 자리(모서리)에 뜬다.
-        self._blink_frames = _get_blink_hint_frames(px(160))
-        self._blink_frame_idx = 0
-        self._blink_anim_job = None
-        self.lbl_blink_hint = None
-        if self._blink_frames:
-            self.lbl_blink_hint = tk.Label(self, image=self._blink_frames[0][0], bg=CARD_BG, bd=0)
-
-        Button(
-            inner, text=close_text, bg="#DCE7F2", fg="#3A5C7D", bd=0,
-            activebackground="#C7D9EA", activeforeground="#1E293B",
-            font=(UI_FONT, 12, "bold"), height=2, cursor="hand2", command=app.show_idle
-        ).pack(side=tk.BOTTOM, fill=tk.X)
-        self.lbl_remaining = tk.Label(inner, text="", font=(UI_FONT, 10), bg=CARD_BG, fg=TEXT_FAINT)
-        self.lbl_remaining.pack(side=tk.BOTTOM, anchor=tk.E, pady=(0, px(6)))
-
-    def set_status(self, text, fg="#44658A", blink_hint=False):
-        # 화면이 매 프레임 불러서 글자가 바뀔 때만 다시 그린다
-        if self.lbl_status.cget("text") != text or self.lbl_status.cget("fg") != fg:
-            self.lbl_status.config(text=text, fg=fg)
-        if self.lbl_blink_hint is not None:
-            is_showing = bool(self.lbl_blink_hint.winfo_manager())
-            if blink_hint and not is_showing:
-                self.lbl_blink_hint.place(relx=1.0, rely=0.0, x=-px(14), y=px(14), anchor=tk.NE)
-                self._start_blink_animation()
-            elif not blink_hint and is_showing:
-                self.lbl_blink_hint.place_forget()
-                self._stop_blink_animation()
-
-    def _start_blink_animation(self):
-        if len(self._blink_frames) <= 1 or self._blink_anim_job is not None:
-            return  # 프레임이 하나뿐(정지 이미지)이면 애니메이션이 필요 없다
-        self._advance_blink_frame()
-
-    def _stop_blink_animation(self):
-        if self._blink_anim_job is not None:
-            self.after_cancel(self._blink_anim_job)
-            self._blink_anim_job = None
-
-    def _advance_blink_frame(self):
-        if not self.winfo_exists():
+    def set_mode(self, mode):
+        if mode == self._mode:
             return
-        self._blink_frame_idx = (self._blink_frame_idx + 1) % len(self._blink_frames)
-        photo, duration = self._blink_frames[self._blink_frame_idx]
-        self.lbl_blink_hint.config(image=photo)
-        self._blink_anim_job = self.after(duration, self._advance_blink_frame)
+        self._mode = mode
+        self._cancel()
+        self._idx = 0
+        if mode == "search":
+            self.itemconfig(self._center_item, image=self._icons["search"])
+            self._spin_step()
+        elif mode == "face":
+            self.itemconfig(self._ring_item, image=self._rings["blue"])
+            if self._gif:
+                self._gif_step()
+            else:
+                self.itemconfig(self._center_item, image=self._icons["search"])
+        else:
+            ring = {"done": "blue", "warn": "warn", "error": "error"}.get(mode, "track")
+            self.itemconfig(self._ring_item, image=self._rings[ring])
+            self.itemconfig(self._center_item, image=self._icons.get(mode, ""))
+
+    def _spin_step(self):
+        self.itemconfig(self._ring_item, image=self._spin[self._idx])
+        self._idx = (self._idx + 1) % self.SPIN_FRAMES
+        self._job = self.after(33, self._spin_step)
+
+    def _gif_step(self):
+        photo, duration = self._gif[self._idx]
+        self.itemconfig(self._center_item, image=photo)
+        self._idx = (self._idx + 1) % len(self._gif)
+        if len(self._gif) > 1:
+            self._job = self.after(duration, self._gif_step)
+
+
+class StepBox(tk.Canvas):
+    """안내 단계 상자 (번호 · 안내 멘트). 상태: idle / active(지금 할 일) / done(완료)."""
+
+    def __init__(self, master, number, title, width, height, bg=PANEL):
+        super().__init__(master, width=width, height=height, bg=bg, highlightthickness=0, bd=0)
+        self._state = None
+        r = px(14)
+        self._boxes = {
+            "idle": ImageTk.PhotoImage(render_round_rect(width, height, r, PANEL_ALT, bg)),
+            "active": ImageTk.PhotoImage(render_round_rect(width, height, r, BLUE_SOFT, bg, BLUE_LINE)),
+            "done": ImageTk.PhotoImage(render_round_rect(width, height, r, PANEL_ALT, bg)),
+        }
+        d = px(40)
+        self._circles = {
+            "idle": ImageTk.PhotoImage(render_circle(d, BLUE_SOFT)),
+            "active": ImageTk.PhotoImage(render_circle(d, BLUE)),
+            "done": ImageTk.PhotoImage(compose_center(render_circle(d, BLUE),
+                                                      render_icon("check", int(d * 0.55), "#FFFFFF"))),
+        }
+        left = px(18)
+        cx, cy = left + d // 2, height // 2
+        text_x = left + d + px(14)
+        self._box_item = self.create_image(0, 0, anchor=tk.NW)
+        self._circle_item = self.create_image(cx, cy)
+        self._num_item = self.create_text(cx, cy, text=str(number), font=(UI_FONT, 12, "bold"))
+        self._title_item = self.create_text(text_x, cy, text=title, anchor=tk.W,
+                                            font=(UI_FONT, 12, "bold"), width=width - text_x - px(12))
+        self.set_state("idle")
+
+    def set_state(self, state):
+        if state == self._state:
+            return
+        self._state = state
+        self.itemconfig(self._box_item, image=self._boxes[state])
+        self.itemconfig(self._circle_item, image=self._circles[state])
+        self.itemconfig(self._num_item, state=tk.HIDDEN if state == "done" else tk.NORMAL,
+                        fill=BLUE if state == "idle" else "white")
+        self.itemconfig(self._title_item, fill={"idle": TEXT_SUB, "active": BLUE_DARK, "done": TEXT}[state])
+
+
+class ActionCard(tk.Canvas):
+    """메인 화면의 큰 출근/퇴근 버튼 카드."""
+
+    def __init__(self, master, log_type, command, width, height, bg=BG):
+        super().__init__(master, width=width, height=height, bg=bg, highlightthickness=0, bd=0, cursor="hand2")
+        self.command = command
+        primary = log_type == "CHECK_IN"
+        sh = px(12)
+        r = px(22)
+        if primary:
+            fill, hover, outline, hover_outline = BLUE, BLUE_DARK, None, None
+            title_fg, accent, tile_fill, icon_color, sep = "white", "#BFD0F5", "#3A64C9", "#FFFFFF", "#3D66CC"
+        else:
+            fill, hover, outline, hover_outline = PANEL, "#F3F5FA", BLUE_LINE, BLUE
+            title_fg, accent, tile_fill, icon_color, sep = TEXT, BLUE, BLUE_SOFT, BLUE, LINE
+        self._normal = ImageTk.PhotoImage(render_round_rect(width, height, r, fill, bg, outline, shadow=sh))
+        self._hover = ImageTk.PhotoImage(render_round_rect(width, height, r, hover, bg, hover_outline,
+                                                           outline_width=2, shadow=sh))
+        tile = px(64)
+        self._tile = ImageTk.PhotoImage(compose_center(
+            render_round_rect(tile, tile, px(16), tile_fill),
+            render_icon("in" if primary else "out", px(32), icon_color)))
+
+        x0 = sh + px(32)
+        y0 = sh + px(30)
+        action = ACTION_LABELS[log_type]
+        self._bg_item = self.create_image(0, 0, image=self._normal, anchor=tk.NW)
+        self.create_image(x0, y0, image=self._tile, anchor=tk.NW)
+        self.create_text(width - x0, y0 + px(4), text="CHECK-IN" if primary else "CHECK-OUT",
+                         font=(UI_FONT, 10, "bold"), fill=accent, anchor=tk.NE)
+        self.create_text(x0, y0 + px(96), text=action, font=(UI_FONT, 40, "bold"), fill=title_fg, anchor=tk.NW)
+        line_y = height - sh - px(62)
+        self.create_line(x0, line_y, width - x0, line_y, fill=sep)
+        self.create_text(x0, height - sh - px(31), text=f"{action} 시작",
+                         font=(UI_FONT, 12, "bold"), fill=accent if not primary else "white", anchor=tk.W)
+        self.create_text(width - x0, height - sh - px(33), text="→", font=(UI_FONT, 18, "bold"),
+                         fill=accent if not primary else "white", anchor=tk.E)
+
+        self.bind("<Enter>", lambda e: self.itemconfig(self._bg_item, image=self._hover))
+        self.bind("<Leave>", lambda e: self.itemconfig(self._bg_item, image=self._normal))
+        self.bind("<ButtonRelease-1>", self._on_click)
+
+    def _on_click(self, event):
+        if 0 <= event.x < int(self.cget("width")) and 0 <= event.y < int(self.cget("height")):
+            self.command()
+
+
+class VerifyCard(RoundedPanel):
+    """
+    출근 / 퇴근 / 출석 조회 버튼을 누른 뒤 얼굴이 확인될 때까지 보여주는 화면.
+    카메라 영상은 띄우지 않는다 — 카메라는 뒤에서 얼굴 확인에만 쓴다.
+    """
+    STEPS = {
+        "loading": ("active", "idle", "idle"),
+        "search": ("active", "idle", "idle"),
+        "warn": ("active", "idle", "idle"),
+        "error": ("active", "idle", "idle"),
+        "blink": ("done", "active", "idle"),
+        "done": ("done", "done", "done"),
+    }
+    VISUAL = {"loading": "search", "search": "search", "blink": "face",
+              "warn": "warn", "error": "error", "done": "done"}
+    TITLE_COLOR = {"loading": TEXT_SUB, "search": TEXT, "blink": BLUE,
+                   "warn": WARN, "error": ERR, "done": BLUE}
+
+    def __init__(self, app, kind, master, width, height):
+        super().__init__(master, fill=PANEL, bg=BG, radius=px(24), outline=LINE, shadow=px(16), pad=px(40))
+        self._limit = SESSION_TIMEOUT
+        self._last = None
+        b = self.body
+        inner_w = width - 2 * self.inset
+
+        if kind == "LOOKUP":
+            title = "출석 조회"
+            step3 = "확인 되면 출석 현황이 표시 됩니다."
+        else:
+            action = ACTION_LABELS[kind]
+            title = action
+            step3 = f"확인 되면 자동으로 {action} 처리 됩니다."
+
+        # 1) 제목
+        tk.Label(b, text=title, font=(UI_FONT, 28, "bold"), bg=PANEL, fg=TEXT).pack(anchor=tk.W, pady=(0, px(20)))
+
+        # 2) 안내 멘트 — 지금 해야 할 단계를 파랗게 강조한다
+        steps_row = tk.Frame(b, bg=PANEL)
+        steps_row.pack(fill=tk.X)
+        gap = px(14)
+        box_w = (inner_w - 2 * gap) // 3
+        self.steps = []
+        for i, main in enumerate(("카메라를 정면으로 바라봐 주세요", "눈을 한 번 깜빡여 주세요", step3)):
+            box = StepBox(steps_row, i + 1, main, box_w, px(76))
+            box.pack(side=tk.LEFT, padx=(0 if i == 0 else gap, 0))
+            self.steps.append(box)
+
+        # 4) 하단 — 남은 시간 · 취소 (내용보다 먼저 배치해야 공간이 모자라도 잘리지 않는다)
+        bottom = tk.Frame(b, bg=PANEL)
+        bottom.pack(side=tk.BOTTOM, fill=tk.X)
+        RoundButton(bottom, text="취소", command=app.show_idle, width=px(160), height=px(50),
+                    fill=BLUE_SOFT, hover=BLUE_SOFT_HOVER, fg=BLUE, bg=PANEL).pack(side=tk.RIGHT)
+        timer = tk.Frame(bottom, bg=PANEL)
+        timer.pack(side=tk.LEFT, anchor=tk.W)
+        self.lbl_remaining = tk.Label(timer, text="", font=(UI_FONT, 10), bg=PANEL, fg=MUTED)
+        self.lbl_remaining.pack(anchor=tk.W, pady=(0, px(6)))
+        self.timer_bar = ProgressBar(timer, px(380), px(6))
+        self.timer_bar.pack(anchor=tk.W)
+
+        # 3) 얼굴 확인 상태 — "얼굴을 찾는 중.." / "OOO 학생 얼굴 확인 중" + 눈 깜빡이는 얼굴
+        status = tk.Frame(b, bg=PANEL)
+        status.pack(expand=True)
+        self.visual = StatusVisual(status, px(196))
+        self.visual.pack()
+        self.lbl_title = tk.Label(status, text="", font=(UI_FONT, 20, "bold"), bg=PANEL, fg=TEXT)
+        self.lbl_title.pack(pady=(px(14), px(2)))
+        self.lbl_detail = tk.Label(status, text="", font=(UI_FONT, 12), bg=PANEL, fg=TEXT_SUB,
+                                   justify=tk.CENTER)
+        self.lbl_detail.pack()
+
+        self.set_state("search", "얼굴을 찾는 중..")
+
+    def set_state(self, state, title, detail="", sim=None):
+        # 화면이 매 프레임 부르므로 내용이 바뀔 때만 다시 그린다
+        if (state, title, detail) == self._last:
+            return
+        self._last = (state, title, detail)
+        self.visual.set_mode(self.VISUAL[state])
+        self.lbl_title.config(text=title, fg=self.TITLE_COLOR[state])
+        self.lbl_detail.config(text=detail)
+        for box, step_state in zip(self.steps, self.STEPS[state]):
+            box.set_state(step_state)
 
     def set_remaining(self, seconds):
-        text = f"{seconds}초 뒤 처음 화면으로 돌아갑니다"
+        text = f"{seconds}초"
         if self.lbl_remaining.cget("text") != text:
             self.lbl_remaining.config(text=text)
+        self.timer_bar.set(seconds / self._limit)
 
 
-class AttendanceWaitingFrame(SessionCard):
-    """
-    출근/퇴근 버튼을 누른 뒤 얼굴이 확인될 때까지 보여주는 안내 카드.
-    카메라 영상은 화면에 띄우지 않는다 — 카메라는 뒤에서 얼굴 확인에만 쓴다.
-    """
+class ResultCard(RoundedPanel):
+    """출근/퇴근 처리 결과 — RESULT_POPUP_SECONDS 뒤 저절로 메인 화면으로 돌아간다."""
 
-    def __init__(self, app, log_type, master):
+    def __init__(self, app, student, log_type, success, detail, master):
+        super().__init__(master, fill=PANEL, bg=BG, radius=px(24), outline=LINE, shadow=px(16), pad=px(40))
+        self.app = app
+        self.student = student
+        b = self.body
         action = ACTION_LABELS[log_type]
-        super().__init__(
-            app, action, ACTION_COLORS[log_type][0], "얼굴을 확인하고 있습니다",
-            ("① 카메라를 정면으로 바라봐 주세요",
-             "② 눈을 한 번 깜빡여 주세요",
-             f"③ 확인되면 자동으로 {action} 처리됩니다"),
-            "취소", master=master,
-        )
-        self.set_status("얼굴을 찾는 중...")
+        name = student["name"]
+
+        visual = StatusVisual(b, px(150))
+        visual.pack(pady=(px(10), px(22)))
+        visual.set_mode("done" if success else "warn")
+        headline = f"{name} 학생 {action} 되었습니다." if success else f"{name} 학생 {action} 처리가 되지 않았습니다."
+        tk.Label(b, text=headline, font=(UI_FONT, 22, "bold"), bg=PANEL, fg=TEXT).pack()
+        tk.Label(b, text=detail, font=(UI_FONT, 12), bg=PANEL, fg=TEXT_SUB, justify=tk.CENTER) \
+            .pack(pady=(px(8), 0))
+
+        btn_row = tk.Frame(b, bg=PANEL)
+        btn_row.pack(side=tk.BOTTOM)
+        RoundButton(btn_row, text="출석 조회", command=self.open_stats, width=px(200), height=px(52),
+                    fill=BLUE_SOFT, hover=BLUE_SOFT_HOVER, fg=BLUE, bg=PANEL).pack(side=tk.LEFT, padx=px(6))
+        self.btn_close = RoundButton(btn_row, text="", command=app.show_idle, width=px(200), height=px(52),
+                                     bg=PANEL)
+        self.btn_close.pack(side=tk.LEFT, padx=px(6))
+
+        self._remaining = RESULT_POPUP_SECONDS
+        self._tick()
+
+    def _tick(self):
+        if not self.winfo_exists():
+            return
+        if self._remaining <= 0:
+            self.app.show_idle()
+            return
+        self.btn_close.set_text(f"메인으로 ({self._remaining})")
+        self._remaining -= 1
+        self.after(1000, self._tick)
+
+    def open_stats(self):
+        self.app.show_stats(self.student)
 
 
-class LookupWaitingFrame(SessionCard):
-    """상단 [출석 조회]를 누른 뒤 얼굴을 확인하는 카드. 확인된 본인에게만 출석 시간을 보여준다 (기록은 하지 않는다)."""
+class StatsCard(RoundedPanel):
+    """본인 확인 후 보여주는 이번 주 출석 현황. STATS_POPUP_SECONDS 뒤 저절로 메인 화면으로 돌아간다."""
+    MAX_ROWS = 6
 
-    def __init__(self, app, master):
-        super().__init__(
-            app, "출석 조회", "#1E293B", "얼굴을 확인하고 있습니다",
-            ("① 카메라를 정면으로 바라봐 주세요",
-             "② 눈을 한 번 깜빡여 주세요",
-             "③ 확인되면 본인의 출석 시간이 표시됩니다 (출퇴근은 기록되지 않습니다)"),
-            "취소", master=master,
-        )
-        self.set_status("얼굴을 찾는 중...")
-
-
-class CameraTestFrame(SessionCard):
-    """상단 [카메라 테스트]를 누르면 뜨는 카드 — 출퇴근 기록 없이 카메라와 얼굴 인식만 확인한다."""
-
-    def __init__(self, app):
-        super().__init__(
-            app, "카메라 테스트", "#475569", "출퇴근은 기록되지 않습니다",
-            ("• 카메라 화면이 나오는지 확인하세요",
-             "• 얼굴에 초록 상자 + 이름이 뜨면 정상 인식입니다",
-             "• 빨간 상자(UNKNOWN)면 인식이 안 되는 상태입니다.\n"
-             "   조명을 밝게 하고 정면을 바라보거나, 관리자에게 재등록을 요청하세요"),
-            "닫기",
-        )
-        self.set_status("카메라를 켜는 중...")
-
-
-class AttendanceStatsFrame(tk.Frame):
-    """학생 본인의 이번주 출석 현황 (출근 일수 · 시간 · 부족분 · 오늘 출근 · 패널티 · 이번주 출퇴근 기록)."""
-
-    def __init__(self, master, student_info):
-        super().__init__(master, bg=CARD_BG, bd=1, relief=tk.SOLID)
+    def __init__(self, app, student_info, master, width):
+        super().__init__(master, fill=PANEL, bg=BG, radius=px(24), outline=LINE, shadow=px(16), pad=px(36))
+        self.app = app
         self.student_info = student_info
-
-        tk.Label(self, text="이번주 출석 현황", font=(UI_FONT, 13, "bold"), bg=CARD_BG, fg=TEXT_MAIN) \
-            .pack(anchor=tk.W, padx=px(15), pady=(px(12), px(8)))
-
+        b = self.body
+        inner_w = width - 2 * self.inset
         weekly = get_weekly_attendance_stats(student_info["user_id"])
 
-        # 항목 / 이번주 기록 / 부족분을 표처럼 맞춰서 보여준다. 기준에 못 미친 부족분은 빨간색으로 강조.
-        stats_grid = tk.Frame(self, bg=CARD_BG)
-        stats_grid.pack(anchor=tk.W, fill=tk.X, padx=px(25), pady=px(2))
+        # 상단 — 이름 · 학번 · 자동 닫힘
+        top = tk.Frame(b, bg=PANEL)
+        top.pack(fill=tk.X)
+        name_box = tk.Frame(top, bg=PANEL)
+        name_box.pack(side=tk.LEFT)
+        tk.Label(name_box, text=f"{student_info['name']} 학생의 이번 주 출석 현황", font=(UI_FONT, 22, "bold"),
+                 bg=PANEL, fg=TEXT).pack(anchor=tk.W)
+        tk.Label(name_box, text=f"학번 {student_info['user_id']}",
+                 font=(UI_FONT, 10), bg=PANEL, fg=MUTED).pack(anchor=tk.W, pady=(px(4), 0))
+        self.btn_close = RoundButton(top, text="", command=app.show_idle, width=px(230), height=px(50), bg=PANEL)
+        self.btn_close.pack(side=tk.RIGHT, anchor=tk.N)
 
-        def add_stat_row(row, title, value_text, missing_text):
-            tk.Label(stats_grid, text=f"• {title} :", font=(UI_FONT, 11), bg=CARD_BG, fg="#3A5C7D") \
-                .grid(row=row, column=0, sticky=tk.W, pady=px(2))
-            tk.Label(stats_grid, text=value_text, font=(UI_FONT, 11, "bold"), bg=CARD_BG, fg=TEXT_MAIN) \
-                .grid(row=row, column=1, sticky=tk.W, padx=(px(8), 0), pady=px(2))
-            if missing_text:
-                tk.Label(stats_grid, text=f"부족 {missing_text}", font=(UI_FONT, 11, "bold"), bg=CARD_BG, fg="#D4696B") \
-                    .grid(row=row + 1, column=1, sticky=tk.W, padx=(px(8), 0), pady=(0, px(4)))
-            else:
-                tk.Label(stats_grid, text="기준 충족", font=(UI_FONT, 10, "bold"), bg=CARD_BG, fg="#3E9B7A") \
-                    .grid(row=row + 1, column=1, sticky=tk.W, padx=(px(8), 0), pady=(0, px(4)))
+        # 지표 4개
+        tiles = tk.Frame(b, bg=PANEL)
+        tiles.pack(fill=tk.X, pady=(px(22), px(18)))
+        gap = px(14)
+        tile_w = (inner_w - 3 * gap) // 4
 
-        add_stat_row(
-            0, "출근 일수",
-            f"{weekly['days']}일 / {WEEKLY_REQUIRED_DAYS}일",
-            f"{weekly['missing_days']}일" if weekly["missing_days"] else "",
-        )
-        add_stat_row(
-            2, "출근 시간",
-            f"{format_duration(weekly['seconds'])} / {WEEKLY_REQUIRED_SECONDS // 3600}시간",
-            format_duration(weekly["missing_seconds"]) if weekly["missing_seconds"] else "",
-        )
+        def tile(index, label, value, note, note_color):
+            panel = RoundedPanel(tiles, fill=PANEL_ALT, bg=PANEL, radius=px(16), outline=None, pad=px(18),
+                                 width=tile_w, height=px(122))
+            panel.pack(side=tk.LEFT, padx=(0 if index == 0 else gap, 0))
+            tk.Label(panel.body, text=label, font=(UI_FONT, 10, "bold"), bg=PANEL_ALT, fg=MUTED).pack(anchor=tk.W)
+            lbl_value = tk.Label(panel.body, text=value, font=(UI_FONT, 17, "bold"), bg=PANEL_ALT, fg=TEXT)
+            lbl_value.pack(anchor=tk.W, pady=(px(6), px(2)))
+            lbl_note = tk.Label(panel.body, text=note, font=(UI_FONT, 10, "bold"), bg=PANEL_ALT, fg=note_color)
+            lbl_note.pack(anchor=tk.W)
+            return lbl_value, lbl_note
 
-        # 오늘 출근 현황 — 출근 중이면 1초마다 경과 시간을 갱신한다
-        tk.Label(stats_grid, text="• 오늘 출근 :", font=(UI_FONT, 11), bg=CARD_BG, fg="#3A5C7D") \
-            .grid(row=4, column=0, sticky=tk.W, pady=px(2))
-        self.lbl_today_value = tk.Label(stats_grid, text="", font=(UI_FONT, 11, "bold"), bg=CARD_BG, fg=TEXT_MAIN)
-        self.lbl_today_value.grid(row=4, column=1, sticky=tk.W, padx=(px(8), 0), pady=px(2))
-        self.lbl_today_note = tk.Label(stats_grid, text="", font=(UI_FONT, 10, "bold"), bg=CARD_BG, fg=TEXT_FAINT)
-        self.lbl_today_note.grid(row=5, column=1, sticky=tk.W, padx=(px(8), 0), pady=(0, px(4)))
+        def missing(text):
+            return (f"부족 {text}", ERR) if text else ("기준 충족", BLUE)
 
-        self._today_after_id = None
-        self.bind("<Destroy>", self._stop_today_timer)
-        self._refresh_today_status()
+        tile(0, f"이번 주 출근 일수 (기준 {WEEKLY_REQUIRED_DAYS}일)", f"{weekly['days']}일",
+             *missing(f"{weekly['missing_days']}일" if weekly["missing_days"] else ""))
+        tile(1, f"이번 주 출근 시간 (기준 {WEEKLY_REQUIRED_SECONDS // 3600}시간)", format_duration(weekly["seconds"]),
+             *missing(format_duration(weekly["missing_seconds"]) if weekly["missing_seconds"] else ""))
+        self.lbl_today_value, self.lbl_today_note = tile(2, "오늘 출근", "", "", MUTED)
+        penalty = student_info.get("penalty") or 0
+        tile(3, "패널티", f"{penalty}개",
+             "양호" if penalty == 0 else "주의" if penalty == 1 else "경고 (3진 아웃제)",
+             BLUE if penalty == 0 else WARN if penalty == 1 else ERR)
 
-        # 3진 아웃제 기준 패널티 색상 경고 표기
-        penalty_val = student_info['penalty']
-        penalty_color = "#D4696B" if penalty_val >= 2 else "#C2793A" if penalty_val == 1 else "#3E9B7A"
-
-        penalty_container = tk.Frame(self, bg=CARD_BG)
-        penalty_container.pack(anchor=tk.W, padx=px(25), pady=(px(2), px(4)))
-        tk.Label(penalty_container, text="• 패널티 현황 : ", font=(UI_FONT, 11), bg=CARD_BG, fg="#3A5C7D") \
-            .pack(side=tk.LEFT)
-        tk.Label(penalty_container, text=f"{penalty_val}개", font=(UI_FONT, 11, "bold"), bg=CARD_BG, fg=penalty_color) \
-            .pack(side=tk.LEFT)
-
-        # 이번주 출퇴근 기록 (날짜 · 출근 · 퇴근 · 인정 시간)
-        tk.Label(self, text="이번주 출퇴근 기록", font=(UI_FONT, 11, "bold"), bg=CARD_BG, fg=TEXT_MAIN) \
-            .pack(anchor=tk.W, padx=px(15), pady=(px(10), px(4)))
-        table = tk.Frame(self, bg=CARD_BG)
-        table.pack(anchor=tk.W, fill=tk.X, padx=px(25))
+        # 이번 주 출퇴근 기록 표
+        table = RoundedPanel(b, fill=PANEL, bg=PANEL, radius=px(16), outline=LINE, pad=px(22))
+        table.pack(fill=tk.BOTH, expand=True)
+        t = table.body
+        tk.Label(t, text="이번 주 출퇴근 기록", font=(UI_FONT, 12, "bold"), bg=PANEL, fg=TEXT) \
+            .grid(row=0, column=0, columnspan=4, sticky=tk.W, pady=(0, px(10)))
+        for col in range(4):
+            t.grid_columnconfigure(col, weight=1, uniform="cols")
         for col, heading in enumerate(("날짜", "출근", "퇴근", "인정 시간")):
-            tk.Label(table, text=heading, font=(UI_FONT, 9, "bold"), bg=CARD_BG, fg=TEXT_FAINT) \
-                .grid(row=0, column=col, sticky=tk.W, padx=(0, px(18)))
+            tk.Label(t, text=heading, font=(UI_FONT, 9, "bold"), bg=PANEL_ALT, fg=MUTED, anchor=tk.W,
+                     padx=px(12), pady=px(7)).grid(row=1, column=col, sticky=tk.EW)
         sessions = weekly["sessions"]
         if not sessions:
-            tk.Label(table, text="이번주 기록이 없습니다", font=(UI_FONT, 10), bg=CARD_BG, fg=TEXT_FAINT) \
-                .grid(row=1, column=0, columnspan=4, sticky=tk.W, pady=px(2))
-        for row, s in enumerate(sessions, start=1):
+            tk.Label(t, text="이번 주 기록이 없습니다", font=(UI_FONT, 11), bg=PANEL, fg=MUTED) \
+                .grid(row=2, column=0, columnspan=4, sticky=tk.W, padx=px(12), pady=px(14))
+        shown = sessions[-self.MAX_ROWS:]
+        for row, s in enumerate(shown):
             try:
                 day_text = format_date_ko(datetime.strptime(s["date"], "%Y-%m-%d").date())[5:]
             except (TypeError, ValueError):
@@ -1718,139 +1952,16 @@ class AttendanceStatsFrame(tk.Frame):
             cells = (day_text, s["check_in"] or "-", s["check_out"] or "-",
                      format_duration(seconds) if seconds else "-")
             for col, value in enumerate(cells):
-                tk.Label(table, text=value, font=(UI_FONT, 10), bg=CARD_BG, fg=TEXT_MAIN) \
-                    .grid(row=row, column=col, sticky=tk.W, padx=(0, px(18)), pady=px(1))
+                tk.Label(t, text=value, font=(UI_FONT, 11, "bold" if col == 3 else "normal"), bg=PANEL,
+                         fg=BLUE if (col == 3 and seconds) else TEXT, anchor=tk.W, padx=px(12), pady=px(6)) \
+                    .grid(row=2 + row * 2, column=col, sticky=tk.EW)
+            tk.Frame(t, bg=PANEL_ALT, height=1).grid(row=3 + row * 2, column=0, columnspan=4, sticky=tk.EW)
+        if len(sessions) > len(shown):
+            tk.Label(t, text=f"이전 기록 {len(sessions) - len(shown)}건 더 있음", font=(UI_FONT, 9), bg=PANEL,
+                     fg=MUTED).grid(row=3 + len(shown) * 2, column=0, columnspan=4, sticky=tk.W,
+                                    padx=px(12), pady=(px(6), 0))
 
-        tk.Label(
-            self, text="06:00~24:00 출퇴근만 인정 · 퇴근을 찍어야 시간 인정",
-            font=(UI_FONT, 9), bg=CARD_BG, fg=TEXT_FAINT
-        ).pack(anchor=tk.W, padx=px(25), pady=(px(10), px(12)))
-
-    def _refresh_today_status(self):
-        """오늘 출근 시간을 다시 계산해서 표시한다. 출근 중이면 1초 뒤에 다시 갱신한다."""
-        if not self.winfo_exists():
-            return
-
-        status = get_today_attendance_status(self.student_info["user_id"])
-        total_seconds = status["finished_seconds"] + status["working_seconds"]
-        self.lbl_today_value.config(text=format_duration(total_seconds))
-
-        if status["working_since"]:
-            self.lbl_today_note.config(
-                text=f"출근 중 · {status['working_since']} 출근 (퇴근을 찍어야 시간 인정)", fg="#3E9B7A"
-            )
-            self._today_after_id = self.after(1000, self._refresh_today_status)
-        elif total_seconds > 0:
-            self.lbl_today_note.config(text="퇴근 상태", fg=TEXT_FAINT)
-        else:
-            self.lbl_today_note.config(text="오늘 출근 기록 없음", fg=TEXT_FAINT)
-
-    def _stop_today_timer(self, event=None):
-        """창이 닫히면 갱신 예약을 취소한다."""
-        if event is not None and event.widget is not self:
-            return
-        if self._today_after_id is not None:
-            self.after_cancel(self._today_after_id)
-            self._today_after_id = None
-
-
-class ResultPopup(tk.Toplevel):
-    """
-    출퇴근 처리 결과 안내창 — "OOO 학생 출근 되었습니다." RESULT_POPUP_SECONDS 뒤 저절로 닫힌다.
-    [출석 조회]를 누른 사람에게만 본인 출석 시간을 보여준다 (메인 화면에는 누구의 시간도 띄우지 않는다).
-    """
-
-    def __init__(self, app, student_info, log_type, success, detail):
-        super().__init__(app.window)
-        self.app = app
-        self.student_info = student_info
-        self.overrideredirect(True)  # 제목 표시줄 없이 알림처럼
-        self.attributes("-topmost", True)
-        color = ACTION_COLORS[log_type][0] if success else "#C2793A"
-        self.configure(bg=color)  # 바깥 테두리 색
-
-        body = tk.Frame(self, bg=CARD_BG)
-        body.pack(padx=px(3), pady=px(3))
-        inner = tk.Frame(body, bg=CARD_BG)
-        inner.pack(padx=px(48), pady=px(34))
-
-        action = ACTION_LABELS[log_type]
-        name = student_info["name"]
-        if success:
-            icon, headline = "✅", f"{name} 학생 {action} 되었습니다."
-        else:
-            icon, headline = "⚠️", f"{name} 학생 {action} 처리가 되지 않았습니다."
-
-        tk.Label(inner, text=icon, font=(UI_FONT, 34), bg=CARD_BG, fg=color).pack()
-        tk.Label(inner, text=headline, font=(UI_FONT, 20, "bold"), bg=CARD_BG, fg=TEXT_MAIN) \
-            .pack(pady=(px(8), px(8)))
-        tk.Label(inner, text=detail, font=(UI_FONT, 12), bg=CARD_BG, fg="#44658A", justify=tk.CENTER) \
-            .pack()
-
-        btn_row = tk.Frame(inner, bg=CARD_BG)
-        btn_row.pack(pady=(px(24), 0))
-        Button(
-            btn_row, text="📋 출석 조회", bg="#2F5377", fg="white", bd=0,
-            activebackground="#3E668E", activeforeground="white",
-            font=(UI_FONT, 12, "bold"), padx=px(22), pady=px(8), cursor="hand2", command=self.open_stats
-        ).pack(side=tk.LEFT, padx=px(6))
-        self.btn_close = Button(
-            btn_row, text="", bg="#DCE7F2", fg="#3A5C7D", bd=0,
-            activebackground="#C7D9EA", activeforeground="#1E293B",
-            font=(UI_FONT, 12, "bold"), padx=px(22), pady=px(8), cursor="hand2", command=self.destroy
-        )
-        self.btn_close.pack(side=tk.LEFT, padx=px(6))
-
-        center_on(app.window, self)
-        self._remaining = RESULT_POPUP_SECONDS
-        self._tick()
-
-    def _tick(self):
-        if not self.winfo_exists():
-            return
-        if self._remaining <= 0:
-            self.destroy()
-            return
-        self.btn_close.config(text=f"닫기 ({self._remaining})")
-        self._remaining -= 1
-        self.after(1000, self._tick)
-
-    def open_stats(self):
-        student_info = self.student_info
-        self.destroy()
-        self.app.open_popup(StatsDialog(self.app, student_info))
-
-
-class StatsDialog(tk.Toplevel):
-    """[출석 조회]를 누르면 뜨는 본인 출석 현황 창. STATS_POPUP_SECONDS 뒤 저절로 닫힌다."""
-
-    def __init__(self, app, student_info):
-        super().__init__(app.window)
-        self.title("출석 조회")
-        self.configure(bg=CARD_BG)
-        self.resizable(False, False)
-        self.transient(app.window)
-        self.attributes("-topmost", True)
-
-        body = tk.Frame(self, bg=CARD_BG)
-        body.pack(padx=px(24), pady=px(20))
-
-        tk.Label(body, text=f"{student_info['name']} 님의 출석 조회", font=(UI_FONT, 16, "bold"),
-                 bg=CARD_BG, fg=TEXT_MAIN).pack(anchor=tk.W)
-        tk.Label(body, text=f"학번 {student_info['user_id']} · {student_info['major']}", font=(UI_FONT, 10),
-                 bg=CARD_BG, fg=TEXT_SUB).pack(anchor=tk.W, pady=(px(2), px(12)))
-
-        AttendanceStatsFrame(body, student_info).pack(fill=tk.X)
-
-        self.btn_close = Button(
-            body, text="", bg="#DCE7F2", fg="#3A5C7D", bd=0,
-            activebackground="#C7D9EA", activeforeground="#1E293B",
-            font=(UI_FONT, 12, "bold"), height=2, cursor="hand2", command=self.destroy
-        )
-        self.btn_close.pack(fill=tk.X, pady=(px(14), 0))
-        self.bind("<Escape>", lambda e: self.destroy())
-
-        center_on(app.window, self, rel_y=0.3)
+        self._refresh_today_status()
         self._remaining = STATS_POPUP_SECONDS
         self._tick()
 
@@ -1858,11 +1969,99 @@ class StatsDialog(tk.Toplevel):
         if not self.winfo_exists():
             return
         if self._remaining <= 0:
-            self.destroy()
+            self.app.show_idle()
             return
-        self.btn_close.config(text=f"닫기 ({self._remaining}초 뒤 자동으로 닫힙니다)")
+        self.btn_close.set_text(f"닫기 ({self._remaining}초)")
         self._remaining -= 1
         self.after(1000, self._tick)
+
+    def _refresh_today_status(self):
+        """오늘 출근 시간을 다시 계산해서 표시한다. 출근 중이면 1초 뒤에 다시 갱신한다."""
+        if not self.winfo_exists():
+            return
+        status = get_today_attendance_status(self.student_info["user_id"])
+        total_seconds = status["finished_seconds"] + status["working_seconds"]
+        self.lbl_today_value.config(text=format_duration(total_seconds))
+        if status["working_since"]:
+            self.lbl_today_note.config(text=f"출근 중 · {status['working_since']} 출근", fg=BLUE)
+            self.after(1000, self._refresh_today_status)
+        elif total_seconds > 0:
+            self.lbl_today_note.config(text="퇴근 상태", fg=MUTED)
+        else:
+            self.lbl_today_note.config(text="오늘 출근 기록 없음", fg=MUTED)
+
+
+class CameraTestCard(RoundedPanel):
+    """카메라 테스트 오른쪽 안내 패널 — 출퇴근 기록 없이 카메라와 얼굴 인식만 확인한다."""
+    TITLE_COLOR = {"loading": TEXT_SUB, "search": TEXT, "ok": OK, "unknown": ERR, "error": ERR}
+
+    def __init__(self, app, master, width):
+        super().__init__(master, fill=PANEL, bg=BG, radius=px(20), outline=LINE, shadow=px(10), pad=px(28))
+        self._last = None
+        b = self.body
+        inner_w = width - 2 * self.inset
+
+        tk.Label(b, text="카메라 테스트", font=(UI_FONT, 22, "bold"), bg=PANEL, fg=TEXT) \
+            .pack(anchor=tk.W, pady=(0, px(18)))
+
+        notice = RoundedBox(b, fill=BLUE_SOFT, bg=PANEL, pad=px(14))
+        notice.pack(fill=tk.X)
+        icon_label(notice.body, "info", px(20), BLUE, BLUE_SOFT).pack(side=tk.LEFT, anchor=tk.N, pady=px(1))
+        tk.Label(notice.body, text="카메라 테스트에서는 출퇴근이 기록되지 않습니다.", font=(UI_FONT, 11, "bold"),
+                 bg=BLUE_SOFT, fg=BLUE, justify=tk.LEFT, wraplength=inner_w - px(70)) \
+            .pack(side=tk.LEFT, padx=(px(10), 0))
+
+        # 하단 — 남은 시간 · 닫기 (먼저 배치해야 공간이 모자라도 잘리지 않는다)
+        RoundButton(b, text="닫기", command=app.show_idle, width=inner_w, height=px(52), bg=PANEL) \
+            .pack(side=tk.BOTTOM)
+        timer = RoundedBox(b, fill=PANEL_ALT, bg=PANEL, pad=px(16))
+        timer.pack(side=tk.BOTTOM, fill=tk.X, pady=(0, px(14)))
+        row = tk.Frame(timer.body, bg=PANEL_ALT)
+        row.pack(fill=tk.X)
+        icon_label(row, "clock", px(18), TEXT_SUB, PANEL_ALT).pack(side=tk.LEFT, anchor=tk.N, pady=px(1))
+        tk.Label(row, text=f"{TEST_TIMEOUT}초 동안 켜지며, 자동으로 꺼집니다.",
+                 font=(UI_FONT, 10), bg=PANEL_ALT, fg=TEXT_SUB, justify=tk.LEFT,
+                 wraplength=inner_w - px(70)).pack(side=tk.LEFT, padx=(px(8), 0))
+        bar_row = tk.Frame(timer.body, bg=PANEL_ALT)
+        bar_row.pack(fill=tk.X, pady=(px(10), 0))
+        self.lbl_remaining = tk.Label(bar_row, text="", font=(UI_FONT, 10, "bold"), bg=PANEL_ALT, fg=BLUE)
+        self.lbl_remaining.pack(side=tk.RIGHT)
+        self.timer_bar = ProgressBar(bar_row, inner_w - 2 * px(16) - px(100), px(6), bg=PANEL_ALT,
+                                     track=BLUE_SOFT_HOVER)
+        self.timer_bar.pack(side=tk.LEFT)
+
+        # 인식 결과
+        tk.Label(b, text="인식 결과", font=(UI_FONT, 10, "bold"), bg=PANEL, fg=MUTED) \
+            .pack(anchor=tk.W, pady=(px(20), px(8)))
+        result = RoundedBox(b, fill=PANEL_ALT, bg=PANEL, radius=px(14), pad=px(18))
+        result.pack(fill=tk.X)
+        self.lbl_title = tk.Label(result.body, text="", font=(UI_FONT, 18, "bold"), bg=PANEL_ALT, fg=TEXT,
+                                  anchor=tk.W, justify=tk.LEFT, wraplength=inner_w - px(40))
+        self.lbl_title.pack(fill=tk.X)
+        self.lbl_detail = tk.Label(result.body, text="", font=(UI_FONT, 10), bg=PANEL_ALT, fg=TEXT_SUB,
+                                   anchor=tk.W, justify=tk.LEFT, wraplength=inner_w - px(40))
+        self.lbl_detail.pack(fill=tk.X, pady=(px(4), px(12)))
+        self.sim_bar = ProgressBar(result.body, inner_w - 2 * px(18), px(8), bg=PANEL_ALT, track=BLUE_SOFT_HOVER)
+        self.sim_bar.pack(anchor=tk.W)
+
+        self.set_state("loading", "카메라를 켜는 중..")
+
+    def set_state(self, state, title, detail="", sim=None):
+        key = (state, title, detail)
+        if key != self._last:
+            self._last = key
+            self.lbl_title.config(text=title, fg=self.TITLE_COLOR.get(state, TEXT))
+            self.lbl_detail.config(text=detail)
+        if sim is None:
+            self.sim_bar.set(0)
+        else:
+            self.sim_bar.set(sim, OK if state == "ok" else ERR, marker=THRESHOLD)
+
+    def set_remaining(self, seconds):
+        text = f"남은 시간 {seconds}초"
+        if self.lbl_remaining.cget("text") != text:
+            self.lbl_remaining.config(text=text)
+        self.timer_bar.set(seconds / TEST_TIMEOUT)
 
 
 class PhotoViewer(tk.Toplevel):
@@ -1886,20 +2085,20 @@ class PhotoViewer(tk.Toplevel):
 class AdminDashboardFrame(tk.Frame):
     """ 세번째 이미지: 관리자 로그인시 화면 """
     def __init__(self, parent, admin_email):
-        super().__init__(parent.right_container, bg=CARD_BG)
+        super().__init__(parent.right_container, bg="white")
         self.parent = parent
         self.admin_email = admin_email
 
         # 1행: 관리자 정보 + 로그아웃
-        top_bar = tk.Frame(self, bg=CARD_BG)
+        top_bar = tk.Frame(self, bg="white")
         top_bar.pack(fill=tk.X, pady=(px(10), px(4)), padx=px(12))
 
-        lbl_admin = tk.Label(top_bar, text=f"🔑 관리자: {self.admin_email}", font=(UI_FONT, 11, "bold"), bg=CARD_BG, fg="#3A5C7D")
+        lbl_admin = tk.Label(top_bar, text=f"🔑 관리자: {self.admin_email}", font=(UI_FONT, 11, "bold"), bg="white", fg="#334155")
         lbl_admin.pack(side=tk.LEFT, pady=5)
 
         btn_logout = Button(
-            top_bar, text="로그아웃", bg="#D4696B", fg="white", font=(UI_FONT, 10, "bold"),
-            activebackground="#BF585B", activeforeground="white", bd=0, padx=16, pady=6, cursor="hand2",
+            top_bar, text="로그아웃", bg="#EF4444", fg="white", font=(UI_FONT, 10, "bold"),
+            activebackground="#DC2626", activeforeground="white", bd=0, padx=16, pady=6, cursor="hand2",
             command=self.logout
         )
         btn_logout.pack(side=tk.RIGHT, pady=5)
@@ -1915,19 +2114,19 @@ class AdminDashboardFrame(tk.Frame):
         self.after(0, self.sync_camera_button)
 
         # 2행: 기능 버튼 — 한 줄에 몰아넣으면 글자가 잘려서 아래 줄에 반반 나눠 배치
-        action_bar = tk.Frame(self, bg=CARD_BG)
+        action_bar = tk.Frame(self, bg="white")
         action_bar.pack(fill=tk.X, padx=px(12), pady=(0, px(8)))
 
         btn_refresh = Button(
-            action_bar, text="🔄 창공시스템 명단 새로고침", bg="#4A8CCB", fg="white", font=(UI_FONT, 10, "bold"),
-            activebackground="#3C7AB5", activeforeground="white", bd=0, pady=8, cursor="hand2",
+            action_bar, text="🔄 창공시스템 명단 새로고침", bg="#3B82F6", fg="white", font=(UI_FONT, 10, "bold"),
+            activebackground="#2563EB", activeforeground="white", bd=0, pady=8, cursor="hand2",
             command=self.refresh_roster_data
         )
         btn_refresh.pack(side=tk.LEFT, expand=True, fill=tk.X, padx=(0, 5))
 
         btn_export = Button(
-            action_bar, text="📊 출석 데이터 추출", bg="#3E9B7A", fg="white", font=(UI_FONT, 10, "bold"),
-            activebackground="#34886A", activeforeground="white", bd=0, pady=8, cursor="hand2",
+            action_bar, text="📊 출석 데이터 추출", bg="#10B981", fg="white", font=(UI_FONT, 10, "bold"),
+            activebackground="#059669", activeforeground="white", bd=0, pady=8, cursor="hand2",
             command=self.export_attendance_excel
         )
         btn_export.pack(side=tk.LEFT, expand=True, fill=tk.X, padx=(5, 0))
@@ -1959,7 +2158,7 @@ class AdminDashboardFrame(tk.Frame):
         if self.parent.camera_on:
             self.btn_camera.config(text="📷 화면 끄기", bg="#334155", activebackground="#475569")
         else:
-            self.btn_camera.config(text="📷 화면 켜기", bg="#3E9B7A", activebackground="#34886A")
+            self.btn_camera.config(text="📷 화면 켜기", bg="#10B981", activebackground="#059669")
 
     def logout(self):
         self.parent.set_admin_logged_in(False)
@@ -2170,11 +2369,11 @@ class AdminDashboardFrame(tk.Frame):
         frame = ttk.LabelFrame(self.tab_add_student, text=" 학생 얼굴 및 상세 정보 등록 ")
         frame.pack(fill=tk.BOTH, expand=True, padx=px(10), pady=px(10))
 
-        grid_container = tk.Frame(frame, bg=CARD_BG)
+        grid_container = tk.Frame(frame, bg="#F8FAFC")
         grid_container.pack(padx=px(20), pady=px(20), fill=tk.BOTH, expand=True)
 
         # 창공시스템(SeatManagerApp) 명단에서 골라서 자동 입력 — 수기로 다시 안 쳐도 된다
-        ttk.Label(grid_container, text="창공시스템 명단:", font=(UI_FONT, 10, "bold"), background=CARD_BG).grid(row=0, column=0, padx=px(10), pady=px(8), sticky=tk.W)
+        ttk.Label(grid_container, text="창공시스템 명단:", font=(UI_FONT, 10, "bold"), background="#F8FAFC").grid(row=0, column=0, padx=px(10), pady=px(8), sticky=tk.W)
         self.roster_combo = ttk.Combobox(grid_container, font=(UI_FONT, 10), width=26, state="readonly")
         self.roster_combo.grid(row=0, column=1, padx=px(10), pady=px(8), sticky=tk.W)
         self.roster_combo.bind("<<ComboboxSelected>>", self.on_roster_selected)
@@ -2182,23 +2381,23 @@ class AdminDashboardFrame(tk.Frame):
         btn_reload_roster = Button(grid_container, text="🔄 명단 새로고침", command=lambda: self.reload_roster_combo(show_message_if_empty=True))
         btn_reload_roster.grid(row=0, column=2, padx=px(10), pady=px(8), sticky=tk.W)
 
-        ttk.Label(grid_container, text="학번(ID):", font=(UI_FONT, 10, "bold"), background=CARD_BG).grid(row=1, column=0, padx=px(10), pady=px(8), sticky=tk.W)
+        ttk.Label(grid_container, text="학번(ID):", font=(UI_FONT, 10, "bold"), background="#F8FAFC").grid(row=1, column=0, padx=px(10), pady=px(8), sticky=tk.W)
         self.add_id = ttk.Entry(grid_container, font=(UI_FONT, 11), width=26)
         self.add_id.grid(row=1, column=1, padx=px(10), pady=px(8), sticky=tk.W)
 
-        ttk.Label(grid_container, text="이름:", font=(UI_FONT, 10, "bold"), background=CARD_BG).grid(row=2, column=0, padx=px(10), pady=px(8), sticky=tk.W)
+        ttk.Label(grid_container, text="이름:", font=(UI_FONT, 10, "bold"), background="#F8FAFC").grid(row=2, column=0, padx=px(10), pady=px(8), sticky=tk.W)
         self.add_name = ttk.Entry(grid_container, font=(UI_FONT, 11), width=26)
         self.add_name.grid(row=2, column=1, padx=px(10), pady=px(8), sticky=tk.W)
 
         # 학과는 소프트웨어전공으로 고정이라 입력받지 않고 보여주기만 한다
-        ttk.Label(grid_container, text="전공 학과:", font=(UI_FONT, 10, "bold"), background=CARD_BG).grid(row=3, column=0, padx=px(10), pady=px(8), sticky=tk.W)
-        ttk.Label(grid_container, text=DEPARTMENT_NAME, font=(UI_FONT, 11), background=CARD_BG,
+        ttk.Label(grid_container, text="전공 학과:", font=(UI_FONT, 10, "bold"), background="#F8FAFC").grid(row=3, column=0, padx=px(10), pady=px(8), sticky=tk.W)
+        ttk.Label(grid_container, text=DEPARTMENT_NAME, font=(UI_FONT, 11), background="#F8FAFC",
                   foreground="#334155").grid(row=3, column=1, padx=px(10), pady=px(8), sticky=tk.W)
 
         # 등록 버튼 크기 강화
         btn_register = Button(
-            grid_container, text="💾 카메라 인식 얼굴로 등록", bg="#3E9B7A", fg="white", bd=0,
-            activebackground="#34886A", activeforeground="white", font=(UI_FONT, 12, "bold"),
+            grid_container, text="💾 카메라 인식 얼굴로 등록", bg="#10B981", fg="white", bd=0,
+            activebackground="#059669", activeforeground="white", font=(UI_FONT, 12, "bold"),
             height=2, cursor="hand2", command=self.register_student
         )
         btn_register.grid(row=4, column=0, columnspan=3, pady=px(25), sticky=tk.EW)
@@ -2289,8 +2488,8 @@ class AdminDashboardFrame(tk.Frame):
         self.ent_search_name.bind("<Return>", lambda e: self.load_logs_filtered())
 
         btn_search = Button(
-            filter_frame, text="🔍 조회하기", bg="#4A8CCB", fg="white", font=(UI_FONT, 11, "bold"),
-            bd=0, activebackground="#3C7AB5", activeforeground="white", cursor="hand2", padx=px(12), height=1,
+            filter_frame, text="🔍 조회하기", bg="#3B82F6", fg="white", font=(UI_FONT, 11, "bold"),
+            bd=0, activebackground="#2563EB", activeforeground="white", cursor="hand2", padx=px(12), height=1,
             command=self.load_logs_filtered
         )
         btn_search.grid(row=2, column=2, padx=px(10), pady=5, sticky=tk.E)
@@ -2317,19 +2516,19 @@ class AdminDashboardFrame(tk.Frame):
         self.tree_logs.bind("<Double-1>", lambda e: self.show_log_photo())
         self._log_photos = {}  # 트리뷰 행 id → (사진 상대 경로, 설명)
 
-        result_bar = tk.Frame(self.tab_logs, bg=CARD_BG)
+        result_bar = tk.Frame(self.tab_logs, bg="#F8FAFC")
         result_bar.pack(fill=tk.X, padx=5, pady=(0, 5))
         self.btn_log_photo = Button(
-            result_bar, text="📷 사진 보기", bg="#2F5377", fg="white", bd=0,
-            activebackground="#3E668E", activeforeground="white",
+            result_bar, text="📷 사진 보기", bg="#1E293B", fg="white", bd=0,
+            activebackground="#334155", activeforeground="white",
             font=(UI_FONT, 9, "bold"), padx=px(10), pady=px(3), cursor="hand2", command=self.show_log_photo
         )
         self.btn_log_photo.pack(side=tk.RIGHT, padx=px(8))
-        self.lbl_log_result = tk.Label(result_bar, text="", anchor=tk.W, bg=CARD_BG, fg="#3A5C7D",
+        self.lbl_log_result = tk.Label(result_bar, text="", anchor=tk.W, bg="#F8FAFC", fg="#334155",
                                        font=(UI_FONT, 10, "bold"), padx=px(10), pady=px(6))
         self.lbl_log_result.pack(side=tk.LEFT, fill=tk.X, expand=True)
         tk.Label(self.tab_logs, text=f"📷 행을 더블클릭하면 출퇴근 사진을 봅니다 · 사진은 {PHOTO_RETENTION_DAYS}일 뒤 자동 삭제",
-                 anchor=tk.W, bg=CARD_BG, fg=TEXT_FAINT, font=(UI_FONT, 9)) \
+                 anchor=tk.W, bg="white", fg="#94A3B8", font=(UI_FONT, 9)) \
             .pack(fill=tk.X, padx=px(10), pady=(0, 5))
 
         self.on_log_mode_changed()
@@ -2721,8 +2920,8 @@ class AttendanceApp:
         # 무인 운영(--kiosk): 00:00~06:00(출퇴근 미인정 시간)이 되면 스스로 종료한다.
         # 06:00 재시작은 윈도우 작업 스케줄러가 맡는다 (windows/install.bat 참고).
         self.kiosk = kiosk
-        self.window.title("The Eclipse - 얼굴 인식")
-        self.window.configure(bg="#0C1A33")  # 배경 그림이 깔리기 전 한순간 보이는 색
+        self.window.title("창의공간 얼굴인식 출석체크 시스템")
+        self.window.configure(bg=BG)  # 탁한 흰색 배경
 
         # 창공시스템(SeatManagerApp, MainWindow.xaml)과 동일한 1600x900 레이아웃을 기준으로 한다.
         # 리사이즈를 허용하면 내부 UI 폭/높이가 바뀌면서 학생 등록 탭 같은 화면이 잘려 보일 수 있어서
@@ -2762,37 +2961,22 @@ class AttendanceApp:
         style = ttk.Style()
         style.theme_use('clam')
         
-        # 카드 위에 올라가는 ttk 위젯들도 카드 색(CARD_BG)에 맞춘다
-        style.configure('TFrame', background=CARD_BG)
-        style.configure('TLabel', background=CARD_BG, foreground=TEXT_MAIN, font=(UI_FONT, 10))
-
         # Notebook (Tabs) 스타일링
-        style.configure('TNotebook', background=CARD_BG, borderwidth=0)
-        style.configure('TNotebook.Tab', background='#DCE7F2', foreground='#5B7897', padding=[px(15), px(6)],
-                        font=(UI_FONT, 10, 'bold'), borderwidth=0)
-        style.map('TNotebook.Tab', background=[('selected', '#FFFFFF')], foreground=[('selected', TEXT_MAIN)])
-
+        style.configure('TNotebook', background='#F1F5F9', borderwidth=0)
+        style.configure('TNotebook.Tab', background='#E2E8F0', foreground='#475569', padding=[px(15), px(6)], font=(UI_FONT, 10, 'bold'))
+        style.map('TNotebook.Tab', background=[('selected', '#ffffff')], foreground=[('selected', '#1E293B')])
+        
         # Treeview 스타일링
-        style.configure('Treeview', background='#FFFFFF', fieldbackground='#FFFFFF', foreground='#2A4765',
-                        rowheight=px(28), font=(UI_FONT, 9), borderwidth=0)
-        style.configure('Treeview.Heading', background='#E4EDF6', foreground=TEXT_MAIN, font=(UI_FONT, 10, 'bold'),
-                        borderwidth=0)
-        style.map('Treeview', background=[('selected', '#4A8CCB')], foreground=[('selected', '#FFFFFF')])
-
+        style.configure('Treeview', background='#ffffff', fieldbackground='#ffffff', rowheight=px(28), font=(UI_FONT, 9))
+        style.configure('Treeview.Heading', background='#E2E8F0', foreground='#1E293B', font=(UI_FONT, 10, 'bold'))
+        style.map('Treeview', background=[('selected', '#3B82F6')], foreground=[('selected', '#ffffff')])
+        
         # LabelFrame 스타일링
-        style.configure('TLabelframe', background=CARD_BG, bordercolor='#C8D8E8', borderwidth=1)
-        style.configure('TLabelframe.Label', background=CARD_BG, foreground=TEXT_MAIN, font=(UI_FONT, 10, 'bold'))
-
-        # 입력칸·콤보박스·스크롤바도 밝은 톤으로
-        style.configure('TEntry', fieldbackground='#FFFFFF', bordercolor='#C8D8E8')
-        style.configure('TCombobox', fieldbackground='#FFFFFF', background='#FFFFFF')
-        style.configure('TScrollbar', background='#DCE7F2', troughcolor=CARD_BG, bordercolor=CARD_BG,
-                        arrowcolor='#5B7897')
+        style.configure('TLabelframe', background='#ffffff', bordercolor='#CBD5E1', borderwidth=1)
+        style.configure('TLabelframe.Label', background='#ffffff', foreground='#1E293B', font=(UI_FONT, 10, 'bold'))
 
         # Ttk Button 스타일링 크기 및 패딩 조절로 해상도 대폭 업그레이드
-        style.configure('TButton', font=(UI_FONT, 11, 'bold'), padding=px(8),
-                        background='#E4EDF6', foreground=TEXT_MAIN, borderwidth=0)
-        style.map('TButton', background=[('active', '#D2E2F1')])
+        style.configure('TButton', font=(UI_FONT, 11, 'bold'), padding=px(8))
 
         # DB 초기화
         init_db()
@@ -2801,8 +2985,11 @@ class AttendanceApp:
         export_attendance_json()
 
         # InsightFace는 별도 프로세스에서 로드/실행한다 (face_inference_process 참고)
-        self._face_restart_count = 0
-        self._spawn_face_process()
+        self.face_conn, child_conn = multiprocessing.Pipe()
+        self.face_proc = multiprocessing.Process(
+            target=face_inference_process, args=(child_conn, INFERENCE_THREADS), daemon=True
+        )
+        self.face_proc.start()
         self.enrolled_users = load_users()
         self.embed_matrix = None
         self._rebuild_embedding_matrix()
@@ -2814,6 +3001,9 @@ class AttendanceApp:
         # 화면 상태
         #   idle       : 메인 화면. 카메라/얼굴 인식 꺼짐, 출근·퇴근 버튼만 보인다
         #   attendance : 출근/퇴근을 누른 뒤. 카메라가 켜지고 얼굴이 확인되면 자동으로 기록한다
+        #   lookup     : 상단 [출석 조회]. 얼굴로 본인 확인만 하고 기록은 하지 않는다
+        #   result     : 출근/퇴근 처리 결과 (카메라 꺼짐, 잠시 뒤 메인 화면으로)
+        #   stats      : 본인 출석 현황 (카메라 꺼짐, 잠시 뒤 메인 화면으로)
         #   test       : 상단 [카메라 테스트]. 카메라와 인식 결과만 보여주고 기록은 하지 않는다
         #   admin      : 관리자 로그인 후. 학생 등록에 쓰도록 카메라가 켜져 있다
         self.mode = "idle"
@@ -2824,7 +3014,6 @@ class AttendanceApp:
         self._session_card = None       # 오른쪽 안내 카드 (AttendanceWaitingFrame / CameraTestFrame)
         self._candidate_id = None       # 지금 인식되고 있는 학생 — RECOGNIZE_HOLD_SECONDS 동안 유지돼야 기록
         self._candidate_since = 0.0
-        self._popups = []               # 결과 안내창 / 출석 조회 창 — 다음 사람이 버튼을 누르면 닫는다
         self.ai_ready = False           # 얼굴 인식 모델 로딩이 끝났는지
         self.ai_failed = False          # 모델을 받지 못했거나 인식 프로세스가 죽었는지
         self.camera_on = False          # 캡처 스레드가 이 값에 맞춰 카메라 장치를 열고 닫는다
@@ -2879,128 +3068,108 @@ class AttendanceApp:
             self.window.after(1000, self._check_operating_hours)
 
     def create_widgets(self):
-        # 배경 그림 위에 둥근 카드가 떠 있는 구성 (BackdropLabel 참고).
-        # 윗줄 바와 본문이 같은 배경 그림에서 잘라낸 조각이라 경계 없이 이어져 보인다.
-        # 메인 화면은 시안 그대로 배경 사진 위에 카드 두 장만 올린다 (윗줄 바 없음).
-        # 메인이 아닌 화면은 글자가 잘 보이도록 같은 사진을 흐리고 어둡게 깔아서 쓴다.
-        content_frame = tk.Frame(self.window, bg=CARD_BG)
-        content_frame.pack(fill=tk.BOTH, expand=True)
-        self._content_y_range = (0.0, 1.0)
+        # 상단 헤더 — 좌측: 로고 · 제목 / 우측: 날짜·시간, [카메라 테스트] [출석 조회] [관리자]
+        header = tk.Frame(self.window, bg=PANEL, height=px(84))
+        header.pack(fill=tk.X, side=tk.TOP)
+        header.pack_propagate(False)
+        tk.Frame(self.window, bg=LINE, height=1).pack(fill=tk.X, side=tk.TOP)
+
+        header_inner = tk.Frame(header, bg=PANEL)
+        header_inner.pack(fill=tk.BOTH, expand=True, padx=px(28))
+
+        logo = ImageTk.PhotoImage(compose_center(
+            render_round_rect(px(50), px(50), px(14), BLUE_SOFT, PANEL), render_icon("face", px(28), BLUE)))
+        lbl_logo = tk.Label(header_inner, image=logo, bg=PANEL, bd=0)
+        lbl_logo.image = logo
+        lbl_logo.pack(side=tk.LEFT)
+
+        title_box = tk.Frame(header_inner, bg=PANEL)
+        title_box.pack(side=tk.LEFT, padx=(px(14), 0))
+        tk.Label(title_box, text="창의공간 얼굴 인식 출석체크 시스템", bg=PANEL, fg=TEXT,
+                 font=(UI_FONT, 17, "bold")).pack(anchor=tk.W)
+
+        nav = dict(height=px(44), bg=PANEL, font=(UI_FONT, 11, "bold"), padx=px(18))
+        # 로그인 후에는 [관리자 로그아웃]으로 바뀐다
+        self.btn_admin_header = RoundButton(header_inner, text="관리자", command=self.on_admin_header_button, **nav)
+        self.btn_admin_header.pack(side=tk.RIGHT, padx=(px(6), 0))
+        # 관리자 화면에서는 숨기는 버튼 묶음
+        self.header_tools = tk.Frame(header_inner, bg=PANEL)
+        self.header_tools.pack(side=tk.RIGHT, padx=(px(16), 0))
+        # 얼굴 인식이 안 될 때 카메라가 제대로 나오는지 확인하는 용도 (기록은 하지 않는다)
+        self.btn_camera_test = RoundButton(self.header_tools, text="카메라 테스트", command=self.start_camera_test,
+                                           **nav)
+        self.btn_camera_test.pack(side=tk.LEFT)
+        # 얼굴로 본인 확인 후 이번주 출근 시간을 본다 (출퇴근 기록 없이)
+        self.btn_lookup = RoundButton(self.header_tools, text="출석 조회", command=self.start_lookup, **nav)
+        self.btn_lookup.pack(side=tk.LEFT, padx=(px(6), 0))
+        self._update_nav()
+
+        clock_font = (UI_FONT, 13, "bold")
+        self.lbl_clock = RoundButton(
+            header_inner, text="0000-00-00  00:00:00", height=px(44), font=clock_font, bg=PANEL,
+            fill=PANEL_ALT, fg=TEXT, padx=px(16), icon=render_icon("clock", px(18), TEXT_SUB),
+            width=tkfont.Font(font=clock_font).measure("0000-00-00  00:00:00") + px(18 + 10 + 34))
+        self.lbl_clock.pack(side=tk.RIGHT)
+
+        # 메인 콘텐츠 컨테이너 — 메인 / 확인 중(카드) / 카메라 화면을 번갈아 보여준다
+        content_frame = tk.Frame(self.window, bg=BG)
+        content_frame.pack(fill=tk.BOTH, expand=True, padx=px(24), pady=px(22))
         self._build_idle_view(content_frame)
 
-        # 출근/퇴근 확인 중 화면 — 카메라 영상 없이 안내 카드만 가운데에 보여준다
-        self.checking_view = BackdropLabel(
-            content_frame, y_range=self._content_y_range, blur=True,
-            shapes=[{"x": 0.30, "y": 0.10, "w": 0.40, "h": 0.78}],
-        )
+        # 출근/퇴근·출석 조회 확인 중, 결과, 출석 현황 — 카메라 영상 없이 카드만 가운데에 보여준다
+        self.checking_view = tk.Frame(content_frame, bg=BG)
 
         # 카메라 화면 — 카메라 테스트 / 관리자 화면에서만 영상이 보인다
-        self.session_view = BackdropLabel(
-            content_frame, y_range=self._content_y_range, blur=True,
-            shapes=[
-                {"x": 0.018, "y": 0.035, "w": 0.60, "h": 0.93, "radius": px(24), "fill": "#101F36"},
-                {"x": 0.638, "y": 0.035, "w": 0.345, "h": 0.93, "radius": px(24)},
-            ],
-        )
+        self.session_view = tk.Frame(content_frame, bg=BG)
 
         # 좌측: 카메라 패널 (상단 상태바 + 영상 영역)
-        # 카드보다 조금 안쪽에 둬야 카드의 둥근 모서리가 가려지지 않는다
-        self.camera_panel = tk.Frame(self.session_view, bg="#101F36")
-        self.camera_panel.place(relx=0.025, rely=0.047, relwidth=0.586, relheight=0.906)
+        self.camera_panel = RoundedPanel(self.session_view, fill=CAM_BG, bg=BG, radius=px(20), outline=None,
+                                         pad=px(14))
+        self.camera_panel.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        cam = self.camera_panel.body
 
-        cam_bar = tk.Frame(self.camera_panel, bg="#101F36", height=px(44))
+        cam_bar = tk.Frame(cam, bg=CAM_BG, height=px(40))
         cam_bar.pack(fill=tk.X, side=tk.TOP)
         cam_bar.pack_propagate(False)
 
-        self.lbl_cam_status = tk.Label(cam_bar, text="● OFF", bg="#101F36", fg="#D4696B",
+        self.lbl_cam_status = tk.Label(cam_bar, text="● OFF", bg=CAM_BG, fg="#F87171",
                                        font=(UI_FONT, 11, "bold"))
-        self.lbl_cam_status.pack(side=tk.LEFT, padx=px(18))
+        self.lbl_cam_status.pack(side=tk.LEFT, padx=(px(8), px(14)))
 
         # 깜빡임(사람 확인) 상태 — 사진을 들이대면 여기가 회색으로 남는다
-        self.lbl_liveness = tk.Label(cam_bar, text="", bg="#101F36", fg=TEXT_FAINT,
-                                     font=(UI_FONT, 10, "bold"))
+        self.lbl_liveness = tk.Label(cam_bar, text="", bg=CAM_BG, fg="#94A3B8", font=(UI_FONT, 10, "bold"))
         self.lbl_liveness.pack(side=tk.LEFT)
 
         # 영상 영역 — 이미지 크기 계산은 상태바를 뺀 이 영역 기준으로 한다
-        self.video_area = tk.Frame(self.camera_panel, bg="#101F36")
+        self.video_area = tk.Frame(cam, bg=CAM_BG)
         self.video_area.pack(fill=tk.BOTH, expand=True)
 
-        self.video_label = tk.Label(self.video_area, bg="#101F36")
-        self.video_label.pack(padx=px(12), pady=(0, px(12)), fill=tk.BOTH, expand=True)
+        self.video_label = tk.Label(self.video_area, bg=CAM_BG)
+        self.video_label.pack(padx=px(10), pady=px(10), fill=tk.BOTH, expand=True)
 
-        # 우측: 가변 상태 패널 컨테이너 (관리자 화면 등이 여기에 들어간다)
-        self.right_container = tk.Frame(self.session_view, bg=CARD_BG)
-        self.right_container.place(relx=0.645, rely=0.047, relwidth=0.331, relheight=0.906)
+        # 우측: 가변 상태 패널 컨테이너 (카메라 테스트 안내 / 관리자 화면)
+        self.right_container = tk.Frame(self.session_view, width=px(RIGHT_PANEL_WIDTH), bg=BG)
+        self.right_container.pack(side=tk.RIGHT, fill=tk.Y, expand=False, padx=(px(20), 0))
         self.right_container.pack_propagate(False)
 
     def _build_idle_view(self, parent):
-        """메인 화면 — 왼쪽은 브랜드 카드, 오른쪽은 출석체크 카드 (시안 이미지의 위치 그대로)."""
-        # 배경 사진(assets/background.png)에 이미 카드가 찍혀 있어서, 그 위에 같은 자리로
-        # 조금 더 크게 카드를 그려 덮는다. 시안에서 잰 위치: x 0.1438/0.6233, y 0.1282, h 0.6923
-        brand = {"x": 0.1378, "y": 0.1202, "w": 0.4719, "h": 0.7083}
-        panel = {"x": 0.6173, "y": 0.1202, "w": 0.2556, "h": 0.7083}
-        # 아래쪽에 작게 떠 있는 버튼 칩 (시안에는 없지만 관리자/카메라 테스트 진입이 필요하다)
-        chip = {"x": 0.600, "y": 0.906, "w": 0.372, "h": 0.070, "radius": px(20), "fill": CHIP_BG}
-        self.idle_view = BackdropLabel(parent, y_range=self._content_y_range, shapes=[brand, panel, chip])
+        """메인 화면 — 카메라는 꺼져 있고 출근/퇴근 버튼만 가운데에 보여준다."""
+        self.idle_view = tk.Frame(parent, bg=BG)
 
-        self.lbl_clock = tk.Label(self.idle_view, text="", bg=CHIP_BG, fg="#E7F0FA", font=(UI_FONT, 13, "bold"))
-        self.lbl_clock.place(relx=0.958, rely=chip["y"] + chip["h"] / 2, anchor=tk.E)
+        center = tk.Frame(self.idle_view, bg=BG)
+        center.place(relx=0.5, rely=0.5, anchor=tk.CENTER)
 
-        header_btn = dict(bg=CHIP_BG, fg=CHIP_TEXT, bd=0, activebackground=CHIP_BG, activeforeground="white",
-                          font=(UI_FONT, 9, "bold"), padx=px(10), pady=px(3), cursor="hand2")
-        btn_box = tk.Frame(self.idle_view, bg=CHIP_BG)
-        btn_box.place(relx=0.614, rely=chip["y"] + chip["h"] / 2, anchor=tk.W)
-
-        # 관리자 화면에서는 숨기는 버튼 묶음
-        self.header_tools = tk.Frame(btn_box, bg=CHIP_BG)
-        self.header_tools.pack(side=tk.LEFT)
-        # 얼굴 인식이 안 될 때 카메라가 제대로 나오는지 확인하는 용도 (기록은 하지 않는다)
-        self.btn_camera_test = Button(self.header_tools, text="📷 카메라 테스트", command=self.start_camera_test,
-                                      **header_btn)
-        self.btn_camera_test.pack(side=tk.LEFT)
-        # 얼굴로 본인 확인 후 이번주 출근 시간을 본다 (출퇴근 기록 없이)
-        self.btn_lookup = Button(self.header_tools, text="📋 출석 조회", command=self.start_lookup, **header_btn)
-        self.btn_lookup.pack(side=tk.LEFT, padx=(px(6), 0))
-        # 로그인 후에는 [관리자 로그아웃]으로 바뀐다
-        self.btn_admin_header = Button(btn_box, text="🔑 관리자", command=self.on_admin_header_button, **header_btn)
-        self.btn_admin_header.pack(side=tk.LEFT, padx=(px(6), 0))
-
-        # ── 왼쪽: 얼굴 아이콘 + 브랜드
-        icon_size = px(210)
-        self._face_icon = ImageTk.PhotoImage(face_icon_image(icon_size))
-        tk.Label(self.idle_view, image=self._face_icon, bg=CARD_BG, bd=0).place(
-            relx=brand["x"] + brand["w"] / 2, rely=brand["y"] + brand["h"] * 0.33, anchor=tk.CENTER)
-
-        tk.Label(self.idle_view, text="The Eclipse", font=(UI_FONT, 38, "bold"), bg=CARD_BG, fg=TEXT_MAIN).place(
-            relx=brand["x"] + brand["w"] / 2, rely=brand["y"] + brand["h"] * 0.70, anchor=tk.CENTER)
-        tk.Label(self.idle_view, text="얼굴 인식", font=(UI_FONT, 23, "bold"), bg=CARD_BG, fg="#4C7CA8").place(
-            relx=brand["x"] + brand["w"] / 2, rely=brand["y"] + brand["h"] * 0.86, anchor=tk.CENTER)
-
-        # ── 오른쪽: 출석체크
-        center_x = panel["x"] + panel["w"] / 2
-        tk.Label(self.idle_view, text="출석체크", font=(UI_FONT, 27, "bold"), bg=CARD_BG, fg=TEXT_MAIN).place(
-            relx=center_x, rely=panel["y"] + panel["h"] * 0.16, anchor=tk.CENTER)
-
-        btn_row = tk.Frame(self.idle_view, bg=CARD_BG)
-        btn_row.place(relx=center_x, rely=panel["y"] + panel["h"] * 0.42, anchor=tk.CENTER)
-        for log_type, text in (("CHECK_IN", "출석"), ("CHECK_OUT", "퇴근")):
-            PillButton(
-                btn_row, text=text, width=px(132), height=px(62), font_size=px(22),
-                command=lambda t=log_type: self.start_attendance(t)
-            ).pack(side=tk.LEFT, padx=px(8))
-
-        tk.Label(self.idle_view, text="버튼을 누르고\n카메라를 바라보면 기록됩니다",
-                 font=(UI_FONT, 10), bg=CARD_BG, fg=TEXT_SUB, justify=tk.CENTER).place(
-            relx=center_x, rely=panel["y"] + panel["h"] * 0.63, anchor=tk.CENTER)
-
-        tk.Label(self.idle_view, text="06:00~24:00 기록만 인정\n퇴근을 찍어야 시간이 인정됩니다",
-                 font=(UI_FONT, 9), bg=CARD_BG, fg=TEXT_FAINT, justify=tk.CENTER).place(
-            relx=center_x, rely=panel["y"] + panel["h"] * 0.78, anchor=tk.CENTER)
+        card_w, card_h, gap = px(470), px(340), px(24)
+        btn_row = tk.Frame(center, bg=BG)
+        btn_row.pack()
+        for i, log_type in enumerate(("CHECK_IN", "CHECK_OUT")):
+            ActionCard(btn_row, log_type, lambda t=log_type: self.start_attendance(t), card_w, card_h) \
+                .pack(side=tk.LEFT, padx=(0 if i == 0 else gap, 0))
 
         # 얼굴 인식 준비 상태 — 처음 실행하면 모델(약 300MB)을 받느라 몇 분 걸린다 (_update_clock에서 갱신)
-        self.lbl_ai_status = tk.Label(self.idle_view, text="", font=(UI_FONT, 10, "bold"), bg=CARD_BG,
-                                      fg="#C2793A", justify=tk.CENTER, wraplength=px(300))
-        self.lbl_ai_status.place(relx=center_x, rely=panel["y"] + panel["h"] * 0.92, anchor=tk.CENTER)
+        self.lbl_ai_status = tk.Label(center, text="", font=(UI_FONT, 11, "bold"), bg=BG, fg=WARN,
+                                      justify=tk.CENTER)
+        self.lbl_ai_status.pack(pady=(px(14), 0))
 
     def capture_worker(self):
         """
@@ -3010,101 +3179,64 @@ class AttendanceApp:
         """
         cap = None
         while self.is_running:
-            try:
-                if not self.camera_on:
-                    if cap is not None:
-                        cap.release()
-                        cap = None
-                    time.sleep(0.05)
-                    continue
-
-                if cap is None:
-                    cap = open_camera(0)  # OS별로 맞는 백엔드를 고른다 (open_camera 참고)
-                    if not cap.isOpened():
-                        cap.release()
-                        cap = None
-                        self.camera_error = True
-                        time.sleep(1.0)  # 다른 프로그램이 놓아줄 수도 있으니 켜져 있는 동안 1초마다 다시 시도
-                        continue
-                    self.camera_error = False
-                    cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
-                    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
-                    cap.set(cv2.CAP_PROP_FPS, 30)
-                    cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)  # 밀린 옛 프레임 대신 항상 최신 프레임
-
-                ret, frame = cap.read()
-                if not ret:
-                    time.sleep(0.01)
-                    continue
-                if self.camera_on:  # 읽는 사이에 꺼졌다면 버린다
-                    self.latest_frame = cv2.flip(frame, 1)
-                    self.frame_seq += 1
-            except Exception as e:
-                # 드라이버 glitch 등으로 여기서 죽으면 화면이 영영 멈춘 채로 남는다 (프로그램은 떠 있지만
-                # 카메라가 안 움직임). 장치를 닫고 다음 바퀴에 새로 열게 해서 스레드 자체는 계속 돌게 한다.
-                print(f"[출석] 카메라 처리 중 오류가 있었지만 계속 진행합니다 ({type(e).__name__}: {e})")
+            if not self.camera_on:
                 if cap is not None:
                     cap.release()
                     cap = None
-                self.camera_error = True
-                time.sleep(1.0)
+                time.sleep(0.05)
+                continue
+
+            if cap is None:
+                cap = open_camera(0)  # OS별로 맞는 백엔드를 고른다 (open_camera 참고)
+                if not cap.isOpened():
+                    cap.release()
+                    cap = None
+                    self.camera_error = True
+                    time.sleep(1.0)  # 다른 프로그램이 놓아줄 수도 있으니 켜져 있는 동안 1초마다 다시 시도
+                    continue
+                self.camera_error = False
+                cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
+                cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
+                cap.set(cv2.CAP_PROP_FPS, 30)
+                cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)  # 밀린 옛 프레임 대신 항상 최신 프레임
+
+            ret, frame = cap.read()
+            if not ret:
+                time.sleep(0.01)
+                continue
+            if self.camera_on:  # 읽는 사이에 꺼졌다면 버린다
+                self.latest_frame = cv2.flip(frame, 1)
+                self.frame_seq += 1
 
         if cap is not None:
             cap.release()
 
-    def _spawn_face_process(self):
-        """얼굴 인식 전용 프로세스를 새로 띄우고 통신용 Pipe를 연결한다 (최초 실행·재시작 공용)."""
-        self.face_conn, child_conn = multiprocessing.Pipe()
-        self.face_proc = multiprocessing.Process(
-            target=face_inference_process, args=(child_conn, INFERENCE_THREADS), daemon=True
-        )
-        self.face_proc.start()
-
     def ai_worker(self):
-        """
-        최신 프레임을 인식 프로세스로 보내고 결과를 받아온다 (한 번에 1장씩만 보내서 밀리지 않게).
-        인식 프로세스가 죽으면(흔치 않지만 네이티브 라이브러리 쪽 문제 등) 며칠씩 켜두는 동안
-        인식이 영영 멈추지 않도록, 완전히 포기하기 전에 몇 번은 새로 띄워서 이어간다.
-        """
-        MAX_RESTARTS = 5
-        while self.is_running:
-            try:
-                self.face_conn.recv()  # 인식 프로세스의 모델 로딩 완료 신호
-                self.ai_ready = True
-                last_seq = -1
-                while self.is_running:
-                    frame = self.latest_frame
-                    seq = self.frame_seq
-                    generation = self.camera_generation
-                    # 같은 프레임을 두 번 분석하지 않는다 (관리자 탭에서도 학생 등록용 스캔은 계속 유지)
-                    if self.camera_on and frame is not None and seq != last_seq:
-                        last_seq = seq
-                        self.face_conn.send(frame)
-                        results, blink_score, liveness = self.face_conn.recv()
-                        # 분석하는 사이에 카메라를 껐다 켰다면(다음 사람) 예전 얼굴 결과는 버린다
-                        if self.camera_on and generation == self.camera_generation:
-                            self.cached_faces = [DetectedFace(bbox, emb) for bbox, emb in results]
-                            self._update_blink_state(blink_score)
-                            self._update_liveness_state(liveness)
-                    else:
-                        time.sleep(0.005)
-            except (EOFError, OSError):
-                if not self.is_running:
-                    return  # 프로그램을 끄느라 파이프가 닫힌 정상적인 경우
-                self._face_restart_count += 1
-                if self._face_restart_count > MAX_RESTARTS:
-                    print(f"[출석] 얼굴 인식 프로세스가 {MAX_RESTARTS}번 넘게 죽어서 더 이상 재시작하지 않습니다.")
-                    self.ai_failed = True
-                    return
-                print(f"[출석] 얼굴 인식 프로세스가 죽어서 다시 띄웁니다 "
-                      f"({self._face_restart_count}/{MAX_RESTARTS}).")
-                self.ai_ready = False
-                try:
-                    self.face_proc.terminate()
-                    self.face_proc.join(timeout=2.0)
-                except Exception:
-                    pass
-                self._spawn_face_process()
+        """최신 프레임을 인식 프로세스로 보내고 결과를 받아온다 (한 번에 1장씩만 보내서 밀리지 않게)."""
+        try:
+            self.face_conn.recv()  # 인식 프로세스의 모델 로딩 완료 신호
+            self.ai_ready = True
+            last_seq = -1
+            while self.is_running:
+                frame = self.latest_frame
+                seq = self.frame_seq
+                generation = self.camera_generation
+                # 같은 프레임을 두 번 분석하지 않는다 (관리자 탭에서도 학생 등록용 스캔은 계속 유지)
+                if self.camera_on and frame is not None and seq != last_seq:
+                    last_seq = seq
+                    self.face_conn.send(frame)
+                    results, blink_score, liveness = self.face_conn.recv()
+                    # 분석하는 사이에 카메라를 껐다 켰다면(다음 사람) 예전 얼굴 결과는 버린다
+                    if self.camera_on and generation == self.camera_generation:
+                        self.cached_faces = [DetectedFace(bbox, emb) for bbox, emb in results]
+                        self._update_blink_state(blink_score)
+                        self._update_liveness_state(liveness)
+                else:
+                    time.sleep(0.005)
+        except (EOFError, OSError):
+            # 프로그램 종료로 닫힌 경우가 아니면, 모델을 받지 못했거나 인식 프로세스가 죽은 것이다
+            if self.is_running:
+                self.ai_failed = True
 
     def _update_blink_state(self, blink_score):
         """
@@ -3179,9 +3311,10 @@ class AttendanceApp:
                 msg += "\n\n시스템 설정 > 개인정보 보호 및 보안 > 카메라에서\n실행한 앱(터미널 등)을 허용한 뒤 다시 실행하세요"
             if self.video_label.cget("text") != msg:
                 self.video_label.config(image="", text=msg, fg="#F87171", font=(UI_FONT, 13, "bold"))
-                self.lbl_cam_status.config(text="● 카메라 오류", fg="#D4696B")
+                self.lbl_cam_status.config(text="● 카메라 오류", fg="#F87171")
             if self._session_card is not None:
-                self._session_card.set_status("카메라를 열 수 없습니다. 관리자에게 알려주세요.", "#D4696B")
+                self._session_card.set_state("error", "카메라를 열 수 없습니다",
+                                             "관리자에게 알려주세요")
 
         # 출근/퇴근·카메라 테스트 중 시간이 지나면 메인 화면으로 (카메라도 꺼진다)
         if self.mode in ("attendance", "lookup", "test") and self._session_card is not None:
@@ -3235,15 +3368,15 @@ class AttendanceApp:
                 if sim >= THRESHOLD and user:
                     # 이름은 창공시스템 명단(roster.json)을 우선 쓴다 — 새로고침하면 바로 반영된다.
                     display_name = self._resolve_display_name(user)
-                    label = f"{display_name} ({sim:.2f})"
-                    color_bgr = (129, 185, 16)  # Neon Green (#10B981) — cv2는 BGR 순서
+                    label = f"{display_name}  유사도 {sim:.2f}"
+                    color_bgr = (74, 163, 22)  # 초록 (#16A34A) — cv2는 BGR 순서
                 else:
-                    label = "UNKNOWN"
-                    color_bgr = (68, 68, 239)  # Rose Red (#EF4444) — cv2는 BGR 순서
+                    label = f"미등록  유사도 {sim:.2f}" if sim >= 0 else "미등록"
+                    color_bgr = (43, 54, 194)  # 빨강 (#C2362B) — cv2는 BGR 순서
 
-                cv2.rectangle(display, (x1, y1), (x2, y2), color_bgr, 2)
+                cv2.rectangle(display, (x1, y1), (x2, y2), color_bgr, 3)
                 color_rgb = (color_bgr[2], color_bgr[1], color_bgr[0])
-                labels_to_draw.append((x1, max(0, y1 - 28), label, color_rgb))
+                labels_to_draw.append((x1, y1, label, color_rgb))
 
                 if sim > best_sim:
                     best_sim = sim
@@ -3260,16 +3393,21 @@ class AttendanceApp:
 
         img = Image.fromarray(cv2.cvtColor(display, cv2.COLOR_BGR2RGB))
 
-        # 얼굴마다 이름을 한 번씩만, 한글이 제대로 보이게 PIL로 그린다
+        # 얼굴마다 이름 · 유사도를 상자 색 띠 위에 흰 글씨로, 한글이 제대로 보이게 PIL로 그린다
         if labels_to_draw:
             draw = ImageDraw.Draw(img)
-            font = get_korean_font(px(20))
-            for label_x, label_y, text, color_rgb in labels_to_draw:
-                draw.text((label_x + 1, label_y + 1), text, font=font, fill=(0, 0, 0))  # 가독성용 그림자
-                draw.text((label_x, label_y), text, font=font, fill=color_rgb)
+            font = get_korean_font(px(18))
+            pad_x, pad_y = px(8), px(5)
+            for box_x, box_y, text, color_rgb in labels_to_draw:
+                left, top, right, bottom = draw.textbbox((0, 0), text, font=font)
+                tag_w, tag_h = right - left + 2 * pad_x, bottom - top + 2 * pad_y
+                tag_x = max(0, min(box_x - 1, img.width - tag_w))
+                tag_y = box_y - tag_h if box_y - tag_h >= 0 else box_y  # 위가 잘리면 상자 안쪽에
+                draw.rectangle((tag_x, tag_y, tag_x + tag_w, tag_y + tag_h), fill=color_rgb)
+                draw.text((tag_x + pad_x - left, tag_y + pad_y - top), text, font=font, fill=(255, 255, 255))
 
         if self._photo is None:  # 카메라를 켠 뒤 첫 화면 — fps가 계산되기 전에도 LIVE로 바꿔 둔다
-            self.lbl_cam_status.config(text="● LIVE", fg="#3E9B7A")
+            self.lbl_cam_status.config(text="● LIVE", fg="#8FB0FF")
 
         # PhotoImage는 크기가 같으면 새로 만들지 않고 픽셀만 덮어쓴다 (20ms → 9ms)
         if self._photo is None or (self._photo.width(), self._photo.height()) != img.size:
@@ -3285,7 +3423,7 @@ class AttendanceApp:
         now = time.perf_counter()
         elapsed = now - self._fps_since
         if elapsed >= 1.0:
-            self.lbl_cam_status.config(text=f"● LIVE  {self._fps_count / elapsed:.0f} fps", fg="#3E9B7A")
+            self.lbl_cam_status.config(text=f"● LIVE  {self._fps_count / elapsed:.0f} fps", fg="#8FB0FF")
             self._fps_count = 0
             self._fps_since = now
             self._update_liveness_label()
@@ -3293,15 +3431,15 @@ class AttendanceApp:
     def _update_liveness_label(self):
         """실제 사람으로 확인된 상태인지 카메라 상태바에 표시한다."""
         if self.antispoof_enabled and (time.time() - self.last_fake_time) <= LIVENESS_VALID_SECONDS:
-            self.lbl_liveness.config(text="⛔ 사진/화면으로 판단됨", fg="#D4696B")
+            self.lbl_liveness.config(text="·  사진/화면으로 판단됨", fg="#F87171")
         elif not (self.antispoof_enabled or self.liveness_enabled):
             self.lbl_liveness.config(text="")
         elif self.passes_antispoof() and self.has_recent_blink():
-            self.lbl_liveness.config(text="👁 사람 확인됨", fg="#3E9B7A")
+            self.lbl_liveness.config(text="·  사람 확인됨 (눈 깜빡임 확인)", fg="#86EFAC")
         elif not self.has_recent_blink():
-            self.lbl_liveness.config(text="👁 눈을 깜빡여 주세요", fg=TEXT_FAINT)
+            self.lbl_liveness.config(text="·  눈을 깜빡여 주세요", fg="#94A3B8")
         else:
-            self.lbl_liveness.config(text="👁 카메라를 바라봐 주세요", fg=TEXT_FAINT)
+            self.lbl_liveness.config(text="·  카메라를 바라봐 주세요", fg="#94A3B8")
 
     def _process_attendance(self, frame, faces, matched_user):
         """
@@ -3310,34 +3448,37 @@ class AttendanceApp:
         """
         card = self._session_card
         if not self.ai_ready:
-            card.set_status("얼굴 인식을 준비하고 있습니다. 잠시만 기다려 주세요...", "#C2793A")
+            card.set_state("loading", "얼굴 인식 준비 중..")
             return
         if matched_user is None:
             self._candidate_id = None
             if faces:
-                card.set_status("등록되지 않은 얼굴입니다.\n카메라 정면을 바라봐 주세요.", "#D4696B")
+                card.set_state("warn", "등록되지 않은 얼굴입니다")
             else:
-                card.set_status("얼굴을 찾는 중...")
+                card.set_state("search", "얼굴을 찾는 중..")
             return
 
+        # 학생을 찾으면 "OOO 학생 얼굴 확인 중" + 눈 깜빡이는 얼굴을 보여준다.
+        # 깜빡임은 최근 BLINK_VALID_SECONDS 안의 것을 인정하므로 확인 중에 미리 깜빡여도 된다.
         name = self._resolve_display_name(matched_user)
+        checking = f"{name} 학생 얼굴 확인 중"
         now = time.time()
         if self._candidate_id != matched_user["user_id"]:
             self._candidate_id = matched_user["user_id"]
             self._candidate_since = now
         if now - self._candidate_since < RECOGNIZE_HOLD_SECONDS:
-            card.set_status(f"{name} 학생 확인 중...", "#4A8CCB")
+            card.set_state("blink", checking, "눈을 한 번 깜빡여 주세요")
             return
         if not self.passes_antispoof():
             if (now - self.last_fake_time) <= LIVENESS_VALID_SECONDS:
-                card.set_status("사진이나 화면으로 판단됩니다.\n본인이 직접 카메라 앞에 서 주세요.", "#D4696B")
+                card.set_state("error", "사진이나 화면으로 판단됩니다", "본인이 직접 카메라 앞에 서 주세요")
             elif self.last_liveness_status == "input_rejected":
-                card.set_status("얼굴이 너무 가깝습니다.\n카메라에서 조금 물러나 주세요.", "#C2793A")
+                card.set_state("warn", "얼굴이 너무 가깝습니다", "카메라에서 조금 물러나 주세요")
             else:
-                card.set_status(f"{name} 학생, 카메라를 정면으로 바라봐 주세요.", "#C2793A")
+                card.set_state("warn", checking, "카메라를 정면으로 바라봐 주세요")
             return
         if not self.has_recent_blink():
-            card.set_status(f"{name} 학생, 눈을 한 번 깜빡여 주세요.", "#C2793A", blink_hint=True)
+            card.set_state("blink", checking, "눈을 한 번 깜빡여 주세요")
             return
 
         # 확인 완료 — 출근/퇴근이면 기록한다 (출석 조회는 조회만). 사진은 남기지 않는다.
@@ -3349,26 +3490,25 @@ class AttendanceApp:
 
     def complete_attendance(self, student):
         if self.mode == "lookup":
-            self.show_idle()
-            self.open_popup(StatsDialog(self, student))  # 기록·사진 없이 본인 출석 현황만
+            self.show_stats(student)  # 기록·사진 없이 본인 출석 현황만
             return
         log_type = self.pending_action
         success, detail = log_attendance(student["user_id"], student["name"], log_type)
-        self.show_idle()  # 카메라를 끄고 메인 화면으로 — 안내창은 그 위에 3초 동안 뜬다
-        self.open_popup(ResultPopup(self, student, log_type, success, detail))
+        self.show_result(student, log_type, success, detail)  # 카메라를 끄고 결과를 3초 동안 보여준다
 
     def _process_camera_test(self, faces, matched_user, best_sim):
         card = self._session_card
         if not self.ai_ready:
-            card.set_status("얼굴 인식을 준비하고 있습니다. 잠시만 기다려 주세요...", "#C2793A")
+            card.set_state("loading", "얼굴 인식 준비 중..")
         elif matched_user is not None:
-            card.set_status(f"정상 인식: {self._resolve_display_name(matched_user)} (유사도 {best_sim:.2f})",
-                            "#3E9B7A")
+            card.set_state("ok", f"{self._resolve_display_name(matched_user)} 학생 인식",
+                           f"유사도 {best_sim:.2f}",
+                           round(best_sim, 2))
         elif faces:
-            card.set_status(f"얼굴은 보이지만 등록된 학생과 일치하지 않습니다 (최고 유사도 {max(best_sim, 0):.2f}, "
-                            f"기준 {THRESHOLD:.2f})", "#D4696B")
+            card.set_state("unknown", "등록되지 않은 얼굴입니다",
+                           f"유사도 {max(best_sim, 0):.2f}", round(max(best_sim, 0), 2))
         else:
-            card.set_status("카메라는 정상입니다. 얼굴이 보이지 않습니다.")
+            card.set_state("search", "얼굴을 찾는 중..")
 
     def set_camera(self, on):
         """카메라와 얼굴 인식을 켜고 끈다. 실제 장치 열기/닫기는 캡처 스레드가 한다."""
@@ -3384,11 +3524,11 @@ class AttendanceApp:
         self.lbl_liveness.config(text="")
         if on:
             self.camera_error = False
-            self.lbl_cam_status.config(text="● 카메라 켜는 중", fg="#C2793A")
-            self.video_label.config(image="", text="📷\n\n카메라를 켜는 중입니다...",
-                                    fg=TEXT_SUB, font=(UI_FONT, 14, "bold"))
+            self.lbl_cam_status.config(text="● 카메라 켜는 중", fg="#FBBF24")
+            self.video_label.config(image="", text="카메라를 켜는 중입니다...",
+                                    fg="#8A94A8", font=(UI_FONT, 14, "bold"))
         else:
-            self.lbl_cam_status.config(text="● OFF", fg="#D4696B")
+            self.lbl_cam_status.config(text="● OFF", fg="#F87171")
             self.video_label.config(image="", text="")
 
     def _reset_liveness(self):
@@ -3403,15 +3543,15 @@ class AttendanceApp:
         if not self.is_running:
             return
         now = datetime.now()
-        self.lbl_clock.config(text=now.strftime("%Y-%m-%d  %H:%M:%S"))
+        self.lbl_clock.set_text(now.strftime("%Y-%m-%d  %H:%M:%S"))
         if self.ai_failed:
-            ai_text, ai_color = ("⚠ 얼굴 인식을 시작하지 못했습니다.\n"
-                                 "인터넷 연결을 확인하고 프로그램을 다시 실행하세요. (logs\\app.log 참고)"), "#D4696B"
+            ai_text, ai_color = ("얼굴 인식을 시작하지 못했습니다.\n"
+                                 "인터넷 연결을 확인하고 프로그램을 다시 실행하세요. (logs\\app.log 참고)"), ERR
         elif not self.ai_ready:
             ai_text, ai_color = ("얼굴 인식을 준비하고 있습니다...\n"
-                                 "처음 실행하면 모델(약 300MB)을 받느라 몇 분 걸립니다."), "#C2793A"
+                                 "처음 실행하면 모델(약 300MB)을 받느라 몇 분 걸립니다."), WARN
         else:
-            ai_text, ai_color = "", "#C2793A"
+            ai_text, ai_color = "", WARN
         if self.lbl_ai_status.cget("text") != ai_text:
             self.lbl_ai_status.config(text=ai_text, fg=ai_color)
         # 프로그램을 며칠씩 켜두어도 3개월 지난 사진이 지워지도록 날짜가 바뀌면 한 번 정리한다
@@ -3474,19 +3614,8 @@ class AttendanceApp:
         return "?"
 
     # ---------- 화면 전환 ----------
-    def open_popup(self, popup):
-        self._popups = [p for p in self._popups if p.winfo_exists()]
-        self._popups.append(popup)
-
-    def close_popups(self):
-        """앞 사람의 결과 안내창/출석 조회 창을 닫는다 (다음 사람이 보지 않도록)."""
-        for popup in self._popups:
-            if popup.winfo_exists():
-                popup.destroy()
-        self._popups = []
-
     def _show_view(self, view):
-        """메인 / 확인 중 / 카메라 화면 중 하나만 보이게 한다."""
+        """메인 / 카드(확인 중·결과·출석 현황) / 카메라 화면 중 하나만 보이게 한다."""
         for other in (self.idle_view, self.checking_view, self.session_view):
             if other is not view:
                 other.pack_forget()
@@ -3500,8 +3629,23 @@ class AttendanceApp:
         for widget in self.checking_view.winfo_children():
             widget.destroy()
 
+    def _show_card(self, card, size):
+        """카드 하나를 콘텐츠 영역 가운데에 띄운다 (카메라 영상 없이)."""
+        width, height = (px(v) for v in size)
+        card.place(relx=0.5, rely=0.5, anchor=tk.CENTER, width=width, height=height)
+        self._show_view(self.checking_view)
+
+    def _update_nav(self):
+        """상단 버튼 중 지금 화면에 해당하는 버튼을 파랗게 칠한다."""
+        active = {"test": self.btn_camera_test, "lookup": self.btn_lookup, "stats": self.btn_lookup,
+                  "admin": self.btn_admin_header}.get(self.mode)
+        for btn in (self.btn_camera_test, self.btn_lookup, self.btn_admin_header):
+            if btn is active:
+                btn.set_style(BLUE, BLUE_DARK, "white")
+            else:
+                btn.set_style(PANEL, BLUE_SOFT, TEXT_SUB, hover_fg=BLUE)
+
     def _start_session(self, mode, card_factory):
-        self.close_popups()
         self.mode = mode
         self.session_started = time.time()
         self._candidate_id = None
@@ -3510,28 +3654,52 @@ class AttendanceApp:
         self._session_card = card_factory()
         if mode in ("attendance", "lookup"):
             # 카메라는 뒤에서만 돌고, 화면에는 안내 카드만 보인다
-            self._session_card.place(relx=0.5, rely=0.47, anchor=tk.CENTER,
-                                     width=px(RIGHT_PANEL_WIDTH), height=px(620))
-            self._show_view(self.checking_view)
+            self._show_card(self._session_card, VERIFY_CARD_SIZE)
         else:
+            # 카메라 테스트 — 카메라가 왼쪽 약 2/3, 안내 패널이 오른쪽 1/3
+            self.right_container.config(width=px(TEST_PANEL_WIDTH))
             self._session_card.pack(fill=tk.BOTH, expand=True)
             self._show_session_layout()
+        self._update_nav()
         self.set_camera(True)
 
     def start_attendance(self, log_type):
         """메인 화면에서 출근/퇴근을 눌렀을 때 — 카메라를 (화면에 띄우지 않고) 켜고 얼굴을 기다린다."""
         self.pending_action = log_type
-        self._start_session("attendance", lambda: AttendanceWaitingFrame(self, log_type, self.checking_view))
+        self._start_session("attendance", lambda: VerifyCard(self, log_type, self.checking_view,
+                                                             *(px(v) for v in VERIFY_CARD_SIZE)))
 
     def start_lookup(self):
         """상단 [출석 조회] — 얼굴로 본인 확인 후 그 학생의 출석 시간만 보여준다 (기록하지 않는다)."""
         self.pending_action = None
-        self._start_session("lookup", lambda: LookupWaitingFrame(self, self.checking_view))
+        self._start_session("lookup", lambda: VerifyCard(self, "LOOKUP", self.checking_view,
+                                                         *(px(v) for v in VERIFY_CARD_SIZE)))
 
     def start_camera_test(self):
         """상단 [카메라 테스트] — 기록 없이 카메라 화면과 인식 결과만 보여준다."""
         self.pending_action = None
-        self._start_session("test", lambda: CameraTestFrame(self))
+        self._start_session("test", lambda: CameraTestCard(self, self.right_container, px(TEST_PANEL_WIDTH)))
+
+    def _end_session(self, mode):
+        """확인이 끝나면 카메라를 끄고 다음 화면(결과 / 출석 현황)으로 넘어갈 준비를 한다."""
+        self.mode = mode
+        self.pending_action = None
+        self._candidate_id = None
+        self._session_card = None
+        self.set_camera(False)
+        self._clear_session_cards()
+        self._update_nav()
+
+    def show_result(self, student, log_type, success, detail):
+        """출근/퇴근 처리 결과 — RESULT_POPUP_SECONDS 뒤 저절로 메인 화면으로 돌아간다."""
+        self._end_session("result")
+        self._show_card(ResultCard(self, student, log_type, success, detail, self.checking_view),
+                        RESULT_CARD_SIZE)
+
+    def show_stats(self, student):
+        """본인 확인된 학생의 이번주 출석 현황 — STATS_POPUP_SECONDS 뒤 저절로 메인 화면으로 돌아간다."""
+        self._end_session("stats")
+        self._show_card(StatsCard(self, student, self.checking_view, px(STATS_CARD_SIZE[0])), STATS_CARD_SIZE)
 
     def show_idle(self):
         """메인 화면 — 카메라와 얼굴 인식을 끄고 출근/퇴근 버튼만 보여준다."""
@@ -3542,9 +3710,10 @@ class AttendanceApp:
         self._clear_session_cards()
         self.set_camera(False)
         self._show_view(self.idle_view)
-        self.btn_admin_header.config(text="🔑 관리자")
+        self.btn_admin_header.set_text("관리자")
         if not self.header_tools.winfo_ismapped():
-            self.header_tools.pack(side=tk.LEFT, before=self.btn_admin_header)
+            self.header_tools.pack(side=tk.RIGHT, padx=(px(16), 0), before=self.lbl_clock)
+        self._update_nav()
 
     def on_admin_header_button(self):
         if self.admin_logged_in:
@@ -3559,17 +3728,18 @@ class AttendanceApp:
             self.show_idle()
             return
 
-        self.close_popups()
         self.mode = "admin"
         self.pending_action = None
         self._session_card = None
         self._clear_session_cards()
+        self.right_container.config(width=px(RIGHT_PANEL_WIDTH))
         frame = AdminDashboardFrame(self, admin_email)
         frame.pack(fill=tk.BOTH, expand=True)
         self._show_session_layout()
         self.set_camera(True)  # 학생 등록 탭에서 얼굴을 찍어야 하므로 켜둔다
-        self.btn_admin_header.config(text="🔒 관리자 로그아웃")
+        self.btn_admin_header.set_text("관리자 로그아웃")
         self.header_tools.pack_forget()  # 관리자 화면은 이미 카메라가 켜져 있다
+        self._update_nav()
 
     def clear_right_container(self):
         for widget in self.right_container.winfo_children():

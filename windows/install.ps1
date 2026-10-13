@@ -60,36 +60,21 @@ Step "필요한 패키지 설치 (처음이면 몇 분 걸립니다)"
 & $Python -m pip install -r (Join-Path $AppDir "requirements.txt")
 if ($LASTEXITCODE -ne 0) { Write-Host "패키지 설치에 실패했습니다. 위 오류를 확인하세요." -ForegroundColor Red; exit 1 }
 
-# mediapipe(눈 깜빡임 검사)는 requirements.txt에 안 넣고 여기서 따로 설치한다.
-# 그냥 설치하면 딸려오는 opencv-contrib-python이 위에서 설치한 opencv-python(cv2)을
-# 다른 버전으로 덮어써서 얼굴 인식이 깨질 수 있어서, --no-deps로 mediapipe만 설치하고
-# 나머지 의존 패키지는 opencv-contrib-python만 빼고 따로 설치한다.
-Step "눈 깜빡임 검사 패키지 설치 (mediapipe)"
-& $Python -m pip install --no-deps mediapipe
-& $Python -m pip install absl-py sounddevice flatbuffers matplotlib certifi
-if ($LASTEXITCODE -ne 0) { Write-Host "mediapipe 설치에 실패했습니다. 눈 깜빡임 검사 없이 계속 진행합니다." -ForegroundColor Yellow }
-
 Step "얼굴 인식 모델 내려받기 (처음 한 번, 약 300MB)"
 Push-Location $AppDir
 try { & $Python attendance_app.py --prepare } finally { Pop-Location }
 if ($LASTEXITCODE -ne 0) { Write-Host "모델 준비에 실패했습니다. 인터넷 연결을 확인하고 다시 실행하세요." -ForegroundColor Red; exit 1 }
 
 # ---------- 3. 자동 실행 ----------
-Step "매일 06:00 자동 실행 + 운영 시간 중 watchdog 작업 등록"
+Step "매일 06:00 자동 실행 작업 등록"
 $launch = "-NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File `"$StartScript`""
 $action = New-ScheduledTaskAction -Execute "powershell.exe" -Argument $launch -WorkingDirectory $AppDir
-# 06:00에 한 번 켜고, 그 뒤로도 18시간 동안 15분마다 "켜져 있는지" 확인한다.
-# start.ps1은 이미 켜져 있으면 바로 종료하는 스크립트라서, 평소엔 그냥 아무 일도 안 하다가
-# 윈도우 업데이트 재부팅이나 예기치 못한 종료로 프로그램이 꺼졌을 때만 15분 안에 알아서 다시 켠다.
 $trigger = New-ScheduledTaskTrigger -Daily -At "06:00"
-$trigger.Repetition = (New-ScheduledTaskTrigger -Once -At "06:00" `
-    -RepetitionInterval (New-TimeSpan -Minutes 15) `
-    -RepetitionDuration (New-TimeSpan -Hours 18)).Repetition
 # StartWhenAvailable: 06:00에 컴퓨터가 꺼져 있었으면 켜진 뒤 바로 실행한다
 $settings = New-ScheduledTaskSettingsSet -StartWhenAvailable -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries
 Register-ScheduledTask -TaskName $TaskName -Action $action -Trigger $trigger -Settings $settings `
-    -Description "창의공간 얼굴인식 출석체크 — 06:00 자동 실행 + 운영 시간 중 15분마다 생존 확인 (00:00 자동 종료)" -Force | Out-Null
-Write-Host "작업 스케줄러에 '$TaskName' 등록 완료 (06:00 자동 실행 + 15분마다 watchdog)"
+    -Description "창의공간 얼굴인식 출석체크 — 06:00 자동 실행 (00:00 자동 종료)" -Force | Out-Null
+Write-Host "작업 스케줄러에 '$TaskName' 등록 완료"
 
 Step "로그인할 때 자동 실행 + 바탕화면 바로가기"
 $shell = New-Object -ComObject WScript.Shell
@@ -113,6 +98,5 @@ Write-Host "바탕화면에 '창의공간 출석체크' 바로가기를 만들�
 Write-Host ""
 Write-Host "=== 설치 완료 ===" -ForegroundColor Green
 Write-Host "· 매일 06:00에 자동으로 켜지고, 00:00에 자동으로 꺼집니다."
-Write-Host "· 운영 시간(06:00~24:00) 중 프로그램이 꺼져 있으면 15분 안에 watchdog이 다시 켭니다."
 Write-Host "· 지금 바로 실행하려면 바탕화면의 '창의공간 출석체크'를 더블클릭하세요."
 Write-Host "· 기본 관리자 계정(1234 / 1234)은 운영 전에 꼭 바꾸세요."

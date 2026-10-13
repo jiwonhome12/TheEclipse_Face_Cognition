@@ -15,10 +15,10 @@ onnxruntime>=1.16.0
 #
 # 주의: mediapipe는 opencv-contrib-python을 의존성으로 끌고 오는데, 이걸 그대로 설치하면
 # 위에 있는 opencv-python(cv2)을 다른 버전으로 덮어써서 얼굴 인식 쪽이 깨질 수 있다.
-# 그래서 여기 목록에는 안 넣고, windows\install.ps1 / windows\update.ps1 이 설치 마지막 단계에서
-# --no-deps로 mediapipe만 따로 설치한다 (opencv-contrib-python 제외). 소스로 직접 설치할 때는
-# 아래 두 줄을 그대로 실행하면 된다:
+# 반드시 아래처럼 --no-deps로 mediapipe만 설치하고, 나머지 의존 패키지는 따로 설치한다:
 #   pip install --no-deps mediapipe
 #   pip install absl-py sounddevice flatbuffers matplotlib certifi
+# (mediapipe가 요구하는 opencv-contrib-python은 설치하지 않는다 — 이미 있는 opencv-python으로 충분하다)
+mediapipe>=0.10.0
 # macOS에서 카메라 권한 요청 창을 띄우고 응답을 기다리는 데 사용 (윈도우에서는 설치 안 됨)
 pyobjc-framework-AVFoundation; sys_platform == "darwin"

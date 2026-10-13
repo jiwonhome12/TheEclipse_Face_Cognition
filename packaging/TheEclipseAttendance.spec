@@ -10,10 +10,7 @@ from PyInstaller.utils.hooks import collect_all
 
 ROOT = os.path.abspath(os.path.join(SPECPATH, ".."))
 
-datas = [
-    (os.path.join(ROOT, "face_landmarker.task"), "."),   # 눈 깜빡임 검사 모델 (Apache 2.0)
-    (os.path.join(ROOT, "assets"), "assets"),            # 배경 사진·깜빡임 안내 이미지
-]
+datas = [(os.path.join(ROOT, "face_landmarker.task"), ".")]  # 눈 깜빡임 검사 모델 (Apache 2.0)
 binaries = []
 hiddenimports = []
 for package in ("mediapipe", "insightface"):

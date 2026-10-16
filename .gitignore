@@ -122,6 +122,12 @@ attendance_photos/
 # 무인 운영 로그 · 설치할 때 기록한 파이썬 경로 (PC마다 다름)
 logs/
 windows/python_path.txt
+# PC마다 다른 카메라 번호 설정
+camera.txt
+# 리눅스/맥에서 프로그램이 하나만 켜지게 하는 잠금 파일
+.app.lock
+# 이 PC(키오스크)에만 해당하는 화면 설정 (메인 버튼 크기 등)
+settings.json
 
 # IDE / 에디터 설정
 .vs/

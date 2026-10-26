@@ -1,10 +1,23 @@
+import os
+
+# MediaPipe/TFLite는 C++ 쪽에서 stderr로 안내 로그(XNNPACK delegate, feedback manager 등)를 직접 찍는다.
+# 파이썬 logging으로는 막히지 않고, 이 설정은 mediapipe를 불러오기 전에 해야 효과가 있어서 맨 위에 둔다.
+# (그래도 남는 absl 로그는 silence_native_stderr()가 모델을 불러오는 동안만 막는다)
+os.environ.setdefault("GLOG_minloglevel", "3")        # 0=INFO 1=WARNING 2=ERROR 3=FATAL
+os.environ.setdefault("GLOG_stderrthreshold", "3")
+os.environ.setdefault("GLOG_logtostderr", "0")
+os.environ.setdefault("TF_CPP_MIN_LOG_LEVEL", "3")
+os.environ.setdefault("ABSL_MIN_LOG_LEVEL", "3")
+
+import collections
+import contextlib
 import cv2
+import io
 import numpy as np
 import threading
 import time
 import sqlite3
 import json
-import os
 import shutil
 import sys
 import multiprocessing
@@ -36,6 +49,32 @@ if sys.stdout is None or sys.stderr is None:
     sys.stderr = sys.stderr or _log_file
 
 DB_PATH = os.path.join(APP_DIR, "faces.db")
+# 이 PC(키오스크)에만 해당하는 화면 설정 — 관리자 화면에서 바꾼다
+SETTINGS_PATH = os.path.join(APP_DIR, "settings.json")
+# 메인 화면 출근/퇴근 카드 크기: 키 → (관리자 화면에 보이는 이름, 기본 디자인 470x340 대비 배율)
+# '크게'는 1600x900 화면에 두 카드를 넣을 수 있는 최대에 가깝다 (더 키우면 양옆 여백이 거의 없다)
+MAIN_BUTTON_SIZES = {"normal": ("보통", 1.4), "large": ("크게", 1.5)}
+DEFAULT_MAIN_BUTTON_SIZE = "normal"
+
+
+def load_settings():
+    """settings.json을 읽는다. 없거나 깨졌으면 빈 설정(전부 기본값)."""
+    try:
+        with open(SETTINGS_PATH, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def save_setting(key, value):
+    """설정 하나를 저장한다. 임시 파일에 다 쓴 뒤 바꿔치기해서, 쓰는 도중 꺼져도 파일이 깨지지 않게 한다."""
+    data = load_settings()
+    data[key] = value
+    temp_path = SETTINGS_PATH + ".tmp"
+    with open(temp_path, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
+    os.replace(temp_path, SETTINGS_PATH)
 THRESHOLD = 0.50
 DEPARTMENT_NAME = "소프트웨어전공"  # 학과는 한 곳뿐이라 입력받지 않고 이 값으로 고정한다
 
@@ -63,7 +102,7 @@ LIVENESS_VALID_SECONDS = 3  # 출퇴근을 누르기 전 이 시간 안에 '실�
 TEST_TIMEOUT = 60              # 카메라 테스트 화면도 켜둔 채 잊지 않도록 이 시간이 지나면 메인 화면으로 돌아간다
 RECOGNIZE_HOLD_SECONDS = 0.6   # 같은 사람으로 이 시간 동안 계속 인식돼야 기록한다 (지나가는 사람 오인식 방지)
 
-# 화면별로 저절로 메인 화면으로 돌아가는 시간(초). 관리자 [설정] 탭에서 5초 단위(5~60초)로 바꾸고 DB에 저장한다.
+# 화면별로 저절로 메인 화면으로 돌아가는 시간(초). 관리자 [설정] 탭에서 5초 단위(5~60초)로 바꾸고 settings.json에 저장한다.
 #   verify : 출근/퇴근/출석 조회 — 이 시간 안에 얼굴이 확인되지 않으면 돌아간다
 #   result : "OOO 학생 출근 되었습니다" 결과 화면
 #   stats  : 이번 주 출석 현황 (뒤 사람이 보지 않도록)
@@ -95,12 +134,37 @@ IS_MAC = sys.platform == "darwin"
 IS_WINDOWS = sys.platform.startswith("win")
 
 # 화면 글꼴 — 맑은 고딕은 윈도우에만 있어서 macOS에서는 기본 한글 글꼴(애플 SD 산돌고딕 Neo)을 쓴다
-UI_FONT = "Apple SD Gothic Neo" if IS_MAC else "맑은 고딕"
+if IS_MAC:
+    UI_FONT = "Apple SD Gothic Neo"
+elif IS_WINDOWS:
+    UI_FONT = "맑은 고딕"
+else:
+    UI_FONT = "NanumGothic"  # 라즈베리파이 등 리눅스 — raspberrypi/install.sh가 fonts-nanum을 설치한다
 
 # macOS의 Tk는 사진을 화면에 올리는 속도(PhotoImage.paste)가 윈도우보다 3~4배 느리다
 # (944x708 기준 윈도우 9ms / 맥 30ms 이상). 카메라 원본이 640x480이라 크게 늘려도 화질은 그대로이므로,
 # 맥에서는 표시 배율에 상한을 둬서 UI 스레드가 그리기에 묶이지 않게 한다. (736x552 ≈ 14ms)
-MAX_DISPLAY_SCALE = 1.15 if IS_MAC else None
+def _is_raspberry_pi():
+    try:
+        with open("/proc/device-tree/model", "rb") as f:
+            return b"Raspberry Pi" in f.read()
+    except OSError:
+        return False
+
+
+# ===== 라즈베리파이처럼 느린 기기용 설정 =====
+# 라즈베리파이에서는 얼굴 분석이 CPU를 쉬지 않고 쓰고, 카메라 30fps를 크게 확대해 그리는 것만으로도
+# 과부하가 걸려 화면이 끊기고 카메라가 멈췄다. 그래서 받는 양·그리는 양·분석 빈도를 줄인다.
+# PC에서 같은 설정을 시험하려면 THE_ECLIPSE_LOW_POWER=1 로 실행한다.
+IS_RASPBERRY_PI = _is_raspberry_pi()
+LOW_POWER = IS_RASPBERRY_PI or os.environ.get("THE_ECLIPSE_LOW_POWER") == "1"
+CAMERA_FPS = 15 if LOW_POWER else 30          # 카메라에서 받는 초당 프레임
+DISPLAY_FPS = 10 if LOW_POWER else None       # 화면에 영상을 그리는 최대 횟수/초 (None = 받는 대로)
+AI_MIN_INTERVAL = 0.25 if LOW_POWER else 0.0  # 얼굴 분석 사이에 쉬는 최소 간격(초) — 화면·카메라에 CPU를 양보
+CAMERA_STALL_SECONDS = 3.0                    # 이 시간 동안 새 영상이 안 오면 카메라를 닫았다 다시 연다
+
+# 카메라 영상을 화면에 그릴 때 최대 확대 배율 — 라즈베리파이는 확대하지 않는다(그리는 픽셀 수가 곧 부하)
+MAX_DISPLAY_SCALE = 1.15 if IS_MAC else (1.0 if LOW_POWER else None)
 
 
 def inference_providers():
@@ -158,6 +222,32 @@ def download_liveness_model():
         return False
 
 
+@contextlib.contextmanager
+def silence_native_stderr():
+    """
+    C++ 라이브러리(MediaPipe/TFLite)가 stderr로 직접 쓰는 안내 메시지를 잠깐 막는다.
+    환경변수(GLOG_*)로 안 막히는 absl 로그까지 확실히 숨기려면 파일 디스크립터 수준에서 돌려야 한다.
+    이 블록이 끝나면 원래대로 돌려놓으므로 우리 앱의 print·오류 메시지는 그대로 보인다.
+    """
+    try:
+        fd = sys.stderr.fileno()
+    except (AttributeError, ValueError, io.UnsupportedOperation):
+        yield  # pythonw처럼 진짜 stderr가 없는 경우 — 막을 것도 없다
+        return
+
+    saved_fd = os.dup(fd)
+    devnull_fd = os.open(os.devnull, os.O_WRONLY)
+    try:
+        sys.stderr.flush()
+        os.dup2(devnull_fd, fd)
+        yield
+    finally:
+        sys.stderr.flush()
+        os.dup2(saved_fd, fd)
+        os.close(saved_fd)
+        os.close(devnull_fd)
+
+
 def create_blink_detector():
     """
     MediaPipe FaceLandmarker를 준비한다. 눈 깜빡임 정도(blendshape)를 읽어
@@ -169,18 +259,20 @@ def create_blink_detector():
         if not download_liveness_model():
             return None
     try:
-        from mediapipe.tasks.python import BaseOptions
-        from mediapipe.tasks.python import vision
-        # 경로 대신 파일 내용을 넘긴다 — MediaPipe는 한글이 들어간 경로(예: '새 폴더')를 열지 못해서
-        # 경로로 넘기면 깜빡임 검사가 소리 없이 꺼진다
-        with open(LIVENESS_MODEL_PATH, "rb") as f:
-            model_bytes = f.read()
-        return vision.FaceLandmarker.create_from_options(vision.FaceLandmarkerOptions(
-            base_options=BaseOptions(model_asset_buffer=model_bytes),
-            running_mode=vision.RunningMode.VIDEO,
-            output_face_blendshapes=True,   # eyeBlinkLeft / eyeBlinkRight 값을 쓰기 위해
-            num_faces=1,
-        ))
+        # 모델을 불러오는 동안 MediaPipe가 찍는 안내 로그는 숨긴다 (silence_native_stderr 참고)
+        with silence_native_stderr():
+            from mediapipe.tasks.python import BaseOptions
+            from mediapipe.tasks.python import vision
+            # 경로 대신 파일 내용을 넘긴다 — MediaPipe는 한글이 들어간 경로(예: '새 폴더')를 열지 못해서
+            # 경로로 넘기면 깜빡임 검사가 소리 없이 꺼진다
+            with open(LIVENESS_MODEL_PATH, "rb") as f:
+                model_bytes = f.read()
+            return vision.FaceLandmarker.create_from_options(vision.FaceLandmarkerOptions(
+                base_options=BaseOptions(model_asset_buffer=model_bytes),
+                running_mode=vision.RunningMode.VIDEO,
+                output_face_blendshapes=True,   # eyeBlinkLeft / eyeBlinkRight 값을 쓰기 위해
+                num_faces=1,
+            ))
     except Exception as e:
         print(f"[출석] 깜빡임 검사를 켜지 못했습니다 ({type(e).__name__}: {e})")
         return None
@@ -222,13 +314,121 @@ def detect_blink_score(landmarker, frame, timestamp_ms):
     return max(scores.get("eyeBlinkLeft", 0.0), scores.get("eyeBlinkRight", 0.0))
 
 
+# ---------- mediapipe를 쓸 수 없는 기기(라즈베리파이 등)용 대체 깜빡임 검사 ----------
+# 얼굴 인식 모델 묶음(buffalo_l)에 들어 있는 106점 얼굴 윤곽 모델(2d106det)의 점 번호
+LMK106_LEFT_EYE = slice(33, 43)
+LMK106_RIGHT_EYE = slice(87, 97)
+LMK106_MOUTH = slice(52, 72)
+LANDMARK_MODEL_PATH = os.path.join(os.path.expanduser("~"), ".insightface", "models", "buffalo_l", "2d106det.onnx")
+
+
+def eye_openness(landmarks):
+    """
+    106점 얼굴 윤곽에서 두 눈이 뜬 정도를 (왼눈, 오른눈)으로 구한다.
+    눈의 세로 폭을 '눈~입 거리'로 나눈 값이라, 사진을 앞뒤로 기울여 얼굴 전체가 납작해져도 값이 거의 그대로다
+    (진짜 깜빡임은 눈만 납작해진다). 세로 방향은 두 눈을 잇는 선에 수직으로 잡아서 고개를 기울여도 괜찮다.
+    """
+    lmk = np.asarray(landmarks, dtype=np.float32)
+    left, right, mouth = lmk[LMK106_LEFT_EYE], lmk[LMK106_RIGHT_EYE], lmk[LMK106_MOUTH]
+    left_c, right_c = left.mean(axis=0), right.mean(axis=0)
+    axis = right_c - left_c
+    length = float(np.linalg.norm(axis))
+    if length < 1.0:
+        return None
+    axis /= length
+    normal = np.array([-axis[1], axis[0]], dtype=np.float32)
+    face_height = abs(float((mouth.mean(axis=0) - (left_c + right_c) / 2) @ normal))
+    if face_height < 1.0:
+        return None
+
+    def height(points):
+        proj = points @ normal
+        return float(proj.max() - proj.min())
+
+    return height(left) / face_height, height(right) / face_height
+
+
+class LandmarkBlinkMeter:
+    """
+    mediapipe 없이 눈이 감긴 정도(0~1)를 낸다 — mediapipe의 eyeBlink 값과 같은 뜻이라 나머지 판정은 그대로 쓴다.
+    - 사람마다 원래 눈 크기가 달라서 고정 기준 대신 '그 사람의 최근 뜬 눈 크기' 대비 얼마나 줄었는지로 본다.
+    - 두 눈이 함께 감겨야 감긴 것으로 본다 (고개를 돌려 한쪽 눈이 가려지는 것은 깜빡임이 아니다).
+    """
+    HISTORY = 30             # 기준(뜬 눈 크기)을 잡을 최근 측정 수
+    MIN_SAMPLES = 5          # 이만큼 모이기 전에는 판단하지 않는다 (None)
+    RESET_AFTER_MISSES = 5   # 얼굴이 이만큼 연속으로 안 보이면 다른 사람으로 보고 기준을 새로 잡는다
+
+    def __init__(self, landmark_model):
+        self.model = landmark_model
+        self.history = collections.deque(maxlen=self.HISTORY)
+        self.misses = 0
+
+    def no_face(self):
+        self.misses += 1
+        if self.misses >= self.RESET_AFTER_MISSES:
+            self.history.clear()
+
+    def score(self, frame, face):
+        self.misses = 0
+        try:
+            openness = eye_openness(self.model.get(frame, face))
+        except Exception:
+            return None
+        if openness is None:
+            return None
+        current = max(openness)  # 한쪽이라도 떠 있으면 뜬 것 — 두 눈이 다 감겨야 감긴 정도가 올라간다
+        self.history.append(current)
+        if len(self.history) < self.MIN_SAMPLES:
+            return None
+        baseline = float(np.percentile(self.history, 90))  # 깜빡이는 순간이 섞여도 '뜬 눈' 크기를 가리킨다
+        if baseline <= 0:
+            return None
+        return float(np.clip(1.0 - current / baseline, 0.0, 1.0))
+
+
+def create_landmark_blink_meter(sess_options=None):
+    """106점 얼굴 윤곽 모델로 대체 깜빡임 검사기를 만든다. 모델 파일이 없거나 실패하면 None."""
+    if not os.path.exists(LANDMARK_MODEL_PATH):
+        print(f"[출석] 눈 깜빡임 대체 검사용 모델이 없습니다 ({LANDMARK_MODEL_PATH})")
+        return None
+    try:
+        import onnxruntime
+        from insightface.model_zoo import model_zoo
+        model = model_zoo.get_model(LANDMARK_MODEL_PATH, providers=inference_providers())
+        model.prepare(ctx_id=0)
+        if sess_options is not None:
+            # 다른 얼굴 모델과 똑같이 CPU 스레드 수를 제한한다 (카메라·화면이 밀리지 않게)
+            model.session = onnxruntime.InferenceSession(
+                LANDMARK_MODEL_PATH, sess_options=sess_options, providers=inference_providers())
+        return LandmarkBlinkMeter(model)
+    except Exception as e:
+        print(f"[출석] 눈 깜빡임 대체 검사를 켜지 못했습니다 ({type(e).__name__}: {e})")
+        return None
+
+
+def blink_mode_forced_to_landmark():
+    """THE_ECLIPSE_BLINK=landmark 이면 mediapipe가 있어도 대체 검사를 쓴다 (PC에서 라즈베리파이 방식을 시험할 때)."""
+    return os.environ.get("THE_ECLIPSE_BLINK", "").lower() == "landmark"
+
+
 _instance_mutex = None
 
 
 def acquire_single_instance():
-    """윈도우 명명 뮤텍스로 프로그램이 하나만 켜지게 한다. 이미 켜져 있으면 False. (윈도우 외에는 항상 True)"""
+    """
+    프로그램이 하나만 켜지게 한다. 이미 켜져 있으면 False.
+    윈도우는 명명 뮤텍스, 그 외(라즈베리파이·맥)는 잠금 파일(flock)을 쓴다 —
+    둘 다 프로그램이 꺼지면 OS가 알아서 풀어준다.
+    """
     global _instance_mutex
     if not IS_WINDOWS:
+        import fcntl
+        try:
+            lock_file = open(os.path.join(APP_DIR, ".app.lock"), "w")
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            return False
+        _instance_mutex = lock_file  # 닫히면 잠금이 풀리므로 프로그램이 끝날 때까지 들고 있는다
         return True
     import ctypes
     kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
@@ -269,6 +469,19 @@ def create_face_app():
 def face_inference_process(conn, threads):
     import onnxruntime
 
+    # 느린 기기(라즈베리파이)에서는 얼굴 분석 프로세스의 우선순위를 낮춘다 — 분석이 CPU를 다 써도
+    # 카메라 읽기와 화면 그리기가 먼저 돌아서 화면이 멈추거나 카메라가 끊기지 않는다 (분석만 조금 늦어진다)
+    if LOW_POWER and hasattr(os, "nice"):
+        try:
+            os.nice(10)
+        except OSError:
+            pass
+    elif LOW_POWER and IS_WINDOWS:  # PC에서 THE_ECLIPSE_LOW_POWER=1로 시험할 때도 똑같이 동작하게
+        import ctypes
+        BELOW_NORMAL_PRIORITY_CLASS = 0x4000
+        ctypes.windll.kernel32.SetPriorityClass(ctypes.windll.kernel32.GetCurrentProcess(),
+                                                BELOW_NORMAL_PRIORITY_CLASS)
+
     app = create_face_app()
 
     # onnxruntime은 기본으로 CPU 코어를 전부 써서 카메라/화면 쪽이 밀린다.
@@ -281,8 +494,14 @@ def face_inference_process(conn, threads):
             model.session.model_path, sess_options=opts, providers=inference_providers()
         )
 
-    # 사진/영상 판별용 깜빡임 검출기 (모델 파일이 없으면 None)
-    blink_landmarker = create_blink_detector()
+    # 사진/영상 판별용 깜빡임 검출기 — mediapipe를 먼저 쓰고, 이 기기에서 안 되면(라즈베리파이 등)
+    # 얼굴 인식 모델 묶음의 106점 윤곽 모델로 대신 잰다. 둘 다 없으면 깜빡임 검사는 꺼진다.
+    blink_landmarker = None if blink_mode_forced_to_landmark() else create_blink_detector()
+    blink_meter = None
+    if blink_landmarker is None:
+        blink_meter = create_landmark_blink_meter(opts)
+        if blink_meter is not None:
+            print("[출석] 눈 깜빡임 검사: mediapipe 대신 얼굴 윤곽 모델(2d106det)을 사용합니다.")
 
     conn.send("ready")
     while True:
@@ -293,11 +512,16 @@ def face_inference_process(conn, threads):
         # 깜빡임이 대신 잡혀서 사진이 통과한다. 가장 큰 얼굴(= 인식 대상)만 잘라서 검사한다.
         blink_score = None
         liveness = None   # (is_live, status) — 위조판별 애드온 결과
+        if not faces and blink_meter is not None:
+            blink_meter.no_face()
         if faces:
             main_face = max(faces, key=lambda f: (f.bbox[2] - f.bbox[0]) * (f.bbox[3] - f.bbox[1]))
-            face_crop = crop_face_region(frame, main_face.bbox)
-            # MediaPipe VIDEO 모드는 타임스탬프가 계속 커져야 한다
-            blink_score = detect_blink_score(blink_landmarker, face_crop, int(time.perf_counter() * 1000))
+            if blink_landmarker is not None:
+                face_crop = crop_face_region(frame, main_face.bbox)
+                # MediaPipe VIDEO 모드는 타임스탬프가 계속 커져야 한다
+                blink_score = detect_blink_score(blink_landmarker, face_crop, int(time.perf_counter() * 1000))
+            elif blink_meter is not None:
+                blink_score = blink_meter.score(frame, main_face)
 
             result = getattr(main_face, "liveness", None)
             if result is not None:
@@ -457,6 +681,98 @@ def open_camera(index=0):
         cap = cv2.VideoCapture(index)
     return cap
 
+
+def preferred_camera_index():
+    """
+    쓸 카메라 번호를 직접 정했으면 그 번호, 아니면 None.
+    환경변수 THE_ECLIPSE_CAMERA 가 먼저이고, 없으면 프로그램 폴더의 camera.txt (숫자 한 줄)를 읽는다.
+    노트북 내장 카메라가 0번이면 외장 USB 카메라는 보통 1번이다. 번호는 --list-cameras 로 확인한다.
+    """
+    value = os.environ.get("THE_ECLIPSE_CAMERA", "").strip()
+    if not value:
+        try:
+            with open(os.path.join(APP_DIR, "camera.txt"), encoding="utf-8-sig") as f:
+                value = f.read().strip()
+        except OSError:
+            return None
+    return int(value) if value.isdigit() else None
+
+
+ACTIVE_CAMERA_INDEX = None  # 지금 실제로 연결된 카메라 번호 (관리자 화면의 카메라 선택에서 보여준다)
+
+
+def save_preferred_camera_index(index):
+    """관리자 화면에서 고른 카메라 번호를 camera.txt에 저장한다 (다음 실행에도 유지)."""
+    with open(os.path.join(APP_DIR, "camera.txt"), "w", encoding="utf-8") as f:
+        f.write(str(int(index)))
+
+
+def camera_candidates():
+    """
+    열어 볼 카메라 번호. 직접 정한 번호(preferred_camera_index)가 있으면 그것이 먼저이고, 없으면 0번이 먼저.
+    리눅스(라즈베리파이)는 과부하·전원 부족으로 USB 카메라가 잠깐 끊겼다 다시 붙으면 번호가 바뀌는
+    경우가 있어서(/dev/video0 → video1), 있는 장치를 차례로 시도한다.
+    """
+    preferred = preferred_camera_index()
+    first = [preferred] if preferred is not None else []
+    if IS_WINDOWS or IS_MAC:
+        return first + [i for i in (0,) if i not in first]
+    try:
+        found = sorted(int(name[5:]) for name in os.listdir("/dev")
+                       if name.startswith("video") and name[5:].isdigit())
+    except OSError:
+        found = []
+    rest = [0] + [i for i in found if i != 0][:10]
+    return first + [i for i in rest if i not in first]
+
+
+def list_cameras(max_index=6):
+    """--list-cameras: 번호별로 실제 영상이 나오는 카메라를 찾아 안내 문구 목록으로 돌려준다."""
+    lines = []
+    for index in range(max_index):
+        cap = open_camera(index)
+        ok = False
+        if cap.isOpened():
+            for _ in range(20):
+                ok, frame = cap.read()
+                if ok:
+                    h, w = frame.shape[:2]
+                    lines.append(f"{index}번: 사용 가능 ({w}x{h})")
+                    break
+                time.sleep(0.05)
+        cap.release()
+        if not ok:
+            lines.append(f"{index}번: 없음 / 영상 안 나옴")
+    return lines
+
+
+def open_working_camera(width=640, height=480, fps=30):
+    """
+    실제로 영상이 나오는 카메라를 찾아 연다. 못 찾으면 None.
+    라즈베리파이에는 영상이 안 나오는 내부 장치(/dev/video10 이후 코덱 장치 등)도 있어서
+    '열림'만 보지 않고 첫 영상을 실제로 받아 본다.
+    """
+    for index in camera_candidates():
+        cap = open_camera(index)
+        if not cap.isOpened():
+            cap.release()
+            continue
+        cap.set(cv2.CAP_PROP_FRAME_WIDTH, width)
+        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, height)
+        cap.set(cv2.CAP_PROP_FPS, fps)
+        cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)  # 밀린 옛 프레임 대신 항상 최신 프레임
+        for _ in range(20):  # 켜자마자는 몇 장 비어서 올 수 있다
+            ok, _frame = cap.read()
+            if ok:
+                global ACTIVE_CAMERA_INDEX
+                ACTIVE_CAMERA_INDEX = index
+                if index != 0:
+                    print(f"[출석] 카메라 {index}번 장치로 연결했습니다.")
+                return cap
+            time.sleep(0.05)
+        cap.release()
+    return None
+
 # ==========================================
 # 0-1. 카메라 화면에 한글 이름을 그리기 위한 폰트
 # ==========================================
@@ -470,6 +786,9 @@ _KOREAN_FONT_CANDIDATES = [
     "/System/Library/Fonts/AppleSDGothicNeo.ttc",  # macOS 기본 한글 폰트
     "/System/Library/Fonts/Supplemental/AppleGothic.ttf",
     "/Library/Fonts/AppleGothic.ttf",
+    "/usr/share/fonts/truetype/nanum/NanumGothic.ttf",          # 리눅스(라즈베리파이) — fonts-nanum
+    "/usr/share/fonts/truetype/nanum/NanumGothicBold.ttf",
+    "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",   # fonts-noto-cjk
 ]
 
 
@@ -745,9 +1064,6 @@ def init_db():
     except sqlite3.OperationalError:
         pass
 
-    # 관리자 [설정] 탭 값 (메인 화면 복귀 시간 등)
-    cursor.execute("CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT)")
-
     # 출석 기록 테이블 (구분, 날짜, 시간 필드 보강)
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS attendance_logs (
@@ -788,24 +1104,19 @@ def init_db():
 
 
 def load_timeouts():
-    """DB에 저장된 메인 화면 복귀 시간을 timeouts에 읽어 온다. 없거나 범위를 벗어나면 기본값."""
-    conn = sqlite3.connect(DB_PATH)
-    rows = dict(conn.execute("SELECT key, value FROM settings WHERE key LIKE 'timeout_%'").fetchall())
-    conn.close()
+    """settings.json에 저장된 메인 화면 복귀 시간을 timeouts에 읽어 온다. 없거나 범위를 벗어나면 기본값."""
+    saved = load_settings()
     for name, default in TIMEOUT_DEFAULTS.items():
         try:
-            value = int(rows.get(f"timeout_{name}", default))
-        except ValueError:
+            value = int(saved.get(f"timeout_{name}", default))
+        except (TypeError, ValueError):
             value = default
         timeouts[name] = value if TIMEOUT_MIN <= value <= TIMEOUT_MAX else default
 
 
 def save_timeout(name, seconds):
     timeouts[name] = seconds
-    conn = sqlite3.connect(DB_PATH)
-    conn.execute("INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)", (f"timeout_{name}", str(seconds)))
-    conn.commit()
-    conn.close()
+    save_setting(f"timeout_{name}", seconds)
 
 
 def load_users():
@@ -1133,6 +1444,300 @@ def center_on(window, popup, rel_y=0.4):
     x = window.winfo_rootx() + (window.winfo_width() - popup.winfo_reqwidth()) // 2
     y = window.winfo_rooty() + int((window.winfo_height() - popup.winfo_reqheight()) * rel_y)
     popup.geometry(f"+{max(0, x)}+{max(0, y)}")
+
+
+# ==========================================
+# 화면 키보드 (터치스크린용 — 라즈베리파이 등)
+# ==========================================
+HANGUL_CHO = "ㄱㄲㄴㄷㄸㄹㅁㅂㅃㅅㅆㅇㅈㅉㅊㅋㅌㅍㅎ"
+HANGUL_JUNG = "ㅏㅐㅑㅒㅓㅔㅕㅖㅗㅘㅙㅚㅛㅜㅝㅞㅟㅠㅡㅢㅣ"
+HANGUL_JONG = ["", "ㄱ", "ㄲ", "ㄳ", "ㄴ", "ㄵ", "ㄶ", "ㄷ", "ㄹ", "ㄺ", "ㄻ", "ㄼ", "ㄽ", "ㄾ", "ㄿ", "ㅀ",
+               "ㅁ", "ㅂ", "ㅄ", "ㅅ", "ㅆ", "ㅇ", "ㅈ", "ㅊ", "ㅋ", "ㅌ", "ㅍ", "ㅎ"]
+COMPOUND_JUNG = {("ㅗ", "ㅏ"): "ㅘ", ("ㅗ", "ㅐ"): "ㅙ", ("ㅗ", "ㅣ"): "ㅚ", ("ㅜ", "ㅓ"): "ㅝ",
+                 ("ㅜ", "ㅔ"): "ㅞ", ("ㅜ", "ㅣ"): "ㅟ", ("ㅡ", "ㅣ"): "ㅢ"}
+COMPOUND_JONG = {("ㄱ", "ㅅ"): "ㄳ", ("ㄴ", "ㅈ"): "ㄵ", ("ㄴ", "ㅎ"): "ㄶ", ("ㄹ", "ㄱ"): "ㄺ", ("ㄹ", "ㅁ"): "ㄻ",
+                 ("ㄹ", "ㅂ"): "ㄼ", ("ㄹ", "ㅅ"): "ㄽ", ("ㄹ", "ㅌ"): "ㄾ", ("ㄹ", "ㅍ"): "ㄿ", ("ㄹ", "ㅎ"): "ㅀ",
+                 ("ㅂ", "ㅅ"): "ㅄ"}
+SPLIT_JONG = {compound: pair for pair, compound in COMPOUND_JONG.items()}
+
+
+def compose_hangul(jamos):
+    """두벌식으로 누른 자모 목록을 한글 글자로 조합한다. 예: ㅎㅏㄴㄱㅡㄹ → 한글, ㄱㅏㄱㅏ → 가가"""
+    out = []
+    cho = jung = jong = None
+
+    def flush():
+        nonlocal cho, jung, jong
+        if cho and jung:
+            out.append(chr(0xAC00 + (HANGUL_CHO.index(cho) * 21 + HANGUL_JUNG.index(jung)) * 28
+                           + HANGUL_JONG.index(jong or "")))
+        elif cho or jung:
+            out.append(cho or jung)  # 자음만 / 모음만 있으면 낱자 그대로
+        cho = jung = jong = None
+
+    for j in jamos:
+        if j in HANGUL_JUNG:
+            if cho and not jung:
+                jung = j
+            elif jung and not jong and (jung, j) in COMPOUND_JUNG:
+                jung = COMPOUND_JUNG[(jung, j)]
+            elif jong:
+                # 받침 뒤에 모음이 오면 받침을 다음 글자 첫소리로 넘긴다 (각+ㅏ → 가가, 앉+ㅏ → 안자)
+                if jong in SPLIT_JONG:
+                    jong, moved = SPLIT_JONG[jong]
+                else:
+                    jong, moved = None, jong
+                flush()
+                cho, jung = moved, j
+            else:
+                flush()
+                jung = j
+        else:
+            if not cho and not jung:
+                cho = j
+            elif jung and not jong and cho and j in HANGUL_JONG:
+                jong = j
+            elif jong and (jong, j) in COMPOUND_JONG:
+                jong = COMPOUND_JONG[(jong, j)]
+            else:
+                flush()
+                cho = j
+    flush()
+    return "".join(out)
+
+
+class OnScreenKeyboard:
+    """
+    입력칸을 누르면 화면 아래(입력칸이 아래쪽에 있으면 위)에 뜨는 터치용 키보드.
+    - 한글은 두벌식으로 직접 조합한다 — 라즈베리파이에서는 Tk 프로그램에 한글 입력기가 연결되지 않는다.
+    - 관리자 로그인 창처럼 다른 화면 클릭을 막는(grab) 창에서도 눌리도록, 키보드 창을 입력칸이 있는 창의
+      자식으로 만든다 (grab은 그 창과 자식 창의 클릭만 받는다).
+    - 키보드가 입력칸을 가려도 무엇을 쳤는지 보이도록 키보드 위쪽에 입력 내용을 같이 보여준다.
+    """
+    LAYOUTS = {
+        "ko": [list("ㅂㅈㄷㄱㅅㅛㅕㅑㅐㅔ"), list("ㅁㄴㅇㄹㅎㅗㅓㅏㅣ"), list("ㅋㅌㅊㅍㅠㅜㅡ")],
+        "en": [list("qwertyuiop"), list("asdfghjkl"), list("zxcvbnm")],
+    }
+    SHIFT_KO = {"ㅂ": "ㅃ", "ㅈ": "ㅉ", "ㄷ": "ㄸ", "ㄱ": "ㄲ", "ㅅ": "ㅆ", "ㅐ": "ㅒ", "ㅔ": "ㅖ"}
+    HEIGHT_RATIO = 0.42  # 메인 창 높이 대비 키보드 높이
+
+    def __init__(self, root, enabled):
+        self.root = root
+        self.enabled = enabled      # 지금 켜져 있는지 묻는 함수 (관리자 화면 설정)
+        self.target = None          # 지금 입력 중인 칸
+        self.panel = None
+        self.mode = "ko"
+        self.shift = False
+        self.jamo = []              # 조합 중인 한글 자모
+        self.comp_start = 0
+        self.comp_len = 0
+        self.dismissed = None       # [완료]로 닫은 입력칸 — 다시 누르기 전까지는 키보드를 띄우지 않는다
+        root.bind_class("TEntry", "<FocusIn>", self._on_focus, add="+")
+        root.bind_class("TEntry", "<Button-1>", self._on_entry_click, add="+")
+
+    # ---------- 보이기 / 숨기기 ----------
+    def _on_focus(self, event):
+        widget = event.widget
+        if not self.enabled() or str(widget.cget("state")) in ("readonly", "disabled"):
+            return
+        # 키보드를 닫으면 커서가 입력칸으로 돌아오며 이 신호가 다시 온다 — 닫은 칸은 다시 눌러야 뜬다
+        if widget is self.dismissed:
+            return
+        if widget is self.target and self.panel is not None and self.panel.winfo_exists() \
+                and self.panel.winfo_ismapped():
+            return
+        self.commit()
+        self.target = widget
+        if not getattr(widget, "_osk_bound", False):
+            widget.bind("<Destroy>", lambda e, w=widget: self.hide() if w is self.target else None, add="+")
+            widget._osk_bound = True
+        self.show()
+
+    def _on_entry_click(self, event):
+        if event.widget is self.target:
+            self.commit()  # 입력칸을 눌러 커서를 옮기면 조합 중이던 글자는 확정한다
+        elif event.widget is self.dismissed:
+            # [완료]로 닫은 칸을 다시 누르면 키보드를 다시 띄운다
+            self.dismissed = None
+            self._on_focus(event)
+
+    def show(self):
+        owner = self.target.winfo_toplevel()
+        if self.panel is None or not self.panel.winfo_exists() or self.panel.master is not owner:
+            if self.panel is not None and self.panel.winfo_exists():
+                self.panel.destroy()
+            self.panel = tk.Toplevel(owner)
+            self.panel.overrideredirect(True)
+            self.panel.configure(bg="#CBD5E1")
+            self._build()
+        self._place()
+        self.panel.deiconify()
+        self._keep_on_top()
+        # 입력칸을 누르면 그 창이 활성화되며 한 박자 늦게 앞으로 올라올 수 있어서, 잠시 뒤 한 번 더 올린다
+        self.panel.after(150, self._keep_on_top)
+        self._refresh_preview()
+
+    def done(self):
+        """[완료] — 지금 칸에서는 키보드를 닫는다 (그 칸을 다시 누르거나 다른 칸을 누르면 다시 뜬다)."""
+        self.dismissed = self.target
+        self.hide()
+
+    def hide(self):
+        self.commit()
+        self.target = None
+        if self.panel is not None and self.panel.winfo_exists():
+            self.panel.withdraw()
+
+    def _place(self):
+        self.root.update_idletasks()
+        w = self.root.winfo_width()
+        h = int(self.root.winfo_height() * self.HEIGHT_RATIO)
+        x = self.root.winfo_rootx()
+        y = self.root.winfo_rooty() + self.root.winfo_height() - h
+        # 입력칸이 키보드에 가려지는 위치면 키보드를 화면 위쪽에 띄운다
+        target_bottom = self.target.winfo_rooty() + self.target.winfo_height()
+        if target_bottom > y - px(10):
+            y = self.root.winfo_rooty()
+        self.panel.geometry(f"{w}x{h}+{x}+{y}")
+
+    # ---------- 자판 그리기 ----------
+    def _build(self):
+        for widget in self.panel.winfo_children():
+            widget.destroy()
+        body = tk.Frame(self.panel, bg="#E2E8F0")
+        body.pack(fill=tk.BOTH, expand=True, padx=1, pady=1)
+
+        self.preview = tk.Label(body, text="", anchor=tk.W, bg="white", fg="#0F172A",
+                                font=(UI_FONT, 15, "bold"), padx=px(14), pady=px(6))
+        self.preview.pack(fill=tk.X, padx=px(8), pady=(px(8), px(4)))
+
+        keys = tk.Frame(body, bg="#E2E8F0")
+        keys.pack(fill=tk.BOTH, expand=True, padx=px(6), pady=(0, px(6)))
+        layout = self.LAYOUTS[self.mode]
+        rows = [list("1234567890")]
+        for i, row in enumerate(layout):
+            if self.shift:
+                row = [self.SHIFT_KO.get(k, k) if self.mode == "ko" else k.upper() for k in row]
+            if i == 2:
+                row = ["⇧"] + row + ["⌫"]
+            rows.append(row)
+        rows.append(["한/영", ".", "@", "␣", "-", "_", "완료"])
+
+        for r, row in enumerate(rows):
+            line = tk.Frame(keys, bg="#E2E8F0")
+            line.pack(fill=tk.BOTH, expand=True)
+            for label in row:
+                self._key(line, label).pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=px(3), pady=px(3))
+
+    def _key(self, parent, label):
+        special = {"⇧": self._toggle_shift, "⌫": self.backspace, "한/영": self._toggle_mode,
+                   "완료": self.done, "␣": lambda: self.press(" ")}
+        command = special.get(label, lambda ch=label: self.press(ch))
+        if label == "완료":
+            colors = dict(bg="#3B82F6", fg="white", activebackground="#2563EB", activeforeground="white")
+        elif label in special:
+            colors = dict(bg="#94A3B8" if not (label == "⇧" and self.shift) else "#475569", fg="white",
+                          activebackground="#64748B", activeforeground="white")
+        else:
+            colors = dict(bg="white", fg="#0F172A", activebackground="#DBEAFE", activeforeground="#0F172A")
+        text = {"␣": "띄어쓰기", "한/영": "한/영" if self.mode == "ko" else "영/한"}.get(label, label)
+        return Button(parent, text=text, font=(UI_FONT, 16, "bold"), bd=0, cursor="hand2",
+                      takefocus=0, command=command, **colors)
+
+    def _toggle_shift(self):
+        self.shift = not self.shift
+        self._build()
+        self._refocus()
+
+    def _toggle_mode(self):
+        self.commit()
+        self.mode = "en" if self.mode == "ko" else "ko"
+        self.shift = False
+        self._build()
+        self._refocus()
+
+    # ---------- 입력 ----------
+    def press(self, ch):
+        t = self.target
+        if t is None or not t.winfo_exists():
+            self.hide()
+            return
+        if self.mode == "ko" and (ch in HANGUL_CHO or ch in HANGUL_JUNG):
+            self._compose(ch)
+        else:
+            self.commit()
+            self._delete_selection()
+            t.insert(tk.INSERT, ch)
+        if self.shift:  # 한 글자만 쌍자음/대문자로 치고 돌아온다
+            self.shift = False
+            self._build()
+        self._refocus()
+
+    def _compose(self, jamo):
+        t = self.target
+        if not self.jamo:
+            self._delete_selection()
+            self.comp_start = t.index(tk.INSERT)
+            self.comp_len = 0
+        self.jamo.append(jamo)
+        self._replace_composition(compose_hangul(self.jamo))
+
+    def _replace_composition(self, text):
+        t = self.target
+        t.delete(self.comp_start, self.comp_start + self.comp_len)
+        t.insert(self.comp_start, text)
+        self.comp_len = len(text)
+        t.icursor(self.comp_start + self.comp_len)
+
+    def backspace(self):
+        t = self.target
+        if t is None or not t.winfo_exists():
+            return
+        if self.jamo:  # 조합 중이면 마지막 자모만 지운다 (한 → 하)
+            self.jamo.pop()
+            self._replace_composition(compose_hangul(self.jamo))
+            if not self.jamo:
+                self.commit()
+        elif t.selection_present():
+            self._delete_selection()
+        else:
+            i = t.index(tk.INSERT)
+            if i > 0:
+                t.delete(i - 1)
+        self._refocus()
+
+    def commit(self):
+        self.jamo = []
+        self.comp_len = 0
+
+    def _delete_selection(self):
+        t = self.target
+        if t is not None and t.selection_present():
+            t.delete(tk.SEL_FIRST, tk.SEL_LAST)
+
+    def _refocus(self):
+        t = self.target
+        # 커서가 이미 입력칸에 있으면 건드리지 않는다 — 윈도우에서는 focus_set이 창을 활성화하면서
+        # 키보드가 다른 창 뒤로 숨어, 첫 글자만 입력되고 다음 키가 안 눌리는 일이 있었다
+        if t is not None and t.winfo_exists() and self.root.focus_get() is not t:
+            t.focus_set()
+        self._keep_on_top()
+        self._refresh_preview()
+
+    def _keep_on_top(self):
+        if self.panel is not None and self.panel.winfo_exists() and self.panel.winfo_ismapped():
+            self.panel.attributes("-topmost", True)
+            self.panel.lift()
+
+    def _refresh_preview(self):
+        if self.panel is None or not self.panel.winfo_exists() or self.target is None \
+                or not self.target.winfo_exists():
+            return
+        text = self.target.get()
+        if str(self.target.cget("show")):
+            text = "•" * len(text)  # 비밀번호는 가려서 보여준다
+        mode = "한글" if self.mode == "ko" else "영어"
+        self.preview.config(text=f"[{mode}]  {text}▏")
 
 
 class AdminLoginDialog(tk.Toplevel):
@@ -1795,19 +2400,18 @@ class StepBox(tk.Canvas):
 
 
 class ActionCard(tk.Canvas):
-    """메인 화면의 큰 출근/퇴근 버튼 카드. 안쪽 여백·글자는 카드 폭(470 기준)에 비례해서 커진다."""
+    """메인 화면의 큰 출근/퇴근 버튼 카드."""
 
-    def __init__(self, master, log_type, command, width, height, bg=BG):
+    def __init__(self, master, log_type, command, width, height, bg=BG, scale=1.0):
         super().__init__(master, width=width, height=height, bg=bg, highlightthickness=0, bd=0, cursor="hand2")
         self.command = command
         primary = log_type == "CHECK_IN"
-        k = width / px(470)
-
-        def s(value):  # 이 카드 안의 크기 — 화면 배율에 카드 배율까지 곱한다
-            return px(value * k)
+        # 카드 안 아이콘·글자·여백은 470x340 카드 기준 값이다. 카드를 키우면 scale만큼 같이 키운다
+        def s(value):
+            return px(value * scale)
 
         def pt(size):
-            return round(size * k)
+            return max(1, int(round(size * scale)))
 
         sh = s(12)
         r = s(22)
@@ -1832,10 +2436,9 @@ class ActionCard(tk.Canvas):
         self.create_image(x0, y0, image=self._tile, anchor=tk.NW)
         self.create_text(width - x0, y0 + s(4), text="CHECK-IN" if primary else "CHECK-OUT",
                          font=(UI_FONT, pt(10), "bold"), fill=accent, anchor=tk.NE)
-        self.create_text(x0, y0 + s(96), text=action, font=(UI_FONT, pt(40), "bold"), fill=title_fg,
-                         anchor=tk.NW)
+        self.create_text(x0, y0 + s(96), text=action, font=(UI_FONT, pt(40), "bold"), fill=title_fg, anchor=tk.NW)
         line_y = height - sh - s(62)
-        self.create_line(x0, line_y, width - x0, line_y, fill=sep, width=max(1, round(k)))
+        self.create_line(x0, line_y, width - x0, line_y, fill=sep)
         self.create_text(x0, height - sh - s(31), text=f"{action} 시작",
                          font=(UI_FONT, pt(12), "bold"), fill=accent if not primary else "white", anchor=tk.W)
         self.create_text(width - x0, height - sh - s(33), text="→", font=(UI_FONT, pt(18), "bold"),
@@ -1893,7 +2496,7 @@ class VerifyCard(RoundedPanel):
         gap = px(16)
         box_w = (inner_w - 2 * gap) // 3
         self.steps = []
-        for i, main in enumerate(("카메라를 정면으로 바라봐 주세요", "눈을 한 번 깜빡여 주세요", step3)):
+        for i, main in enumerate(("카메라를 정면으로 바라봐 주세요", "눈을 천천히 감았다 떠 주세요", step3)):
             box = StepBox(steps_row, i + 1, main, box_w, px(88))
             box.pack(side=tk.LEFT, padx=(0 if i == 0 else gap, 0))
             self.steps.append(box)
@@ -2229,6 +2832,59 @@ class AdminDashboardFrame(tk.Frame):
         """[학생 등록] 탭에서만 카메라를 켜고 왼쪽에 보여준다 (얼굴을 찍어야 하므로)."""
         registering = self.notebook.select() == str(self.tab_add_student)
         self.parent.show_admin_camera(registering)
+        if registering:
+            self.after(1500, self.show_camera_info)
+
+    def choose_osk(self, enabled):
+        self.parent.set_osk_enabled(enabled)
+        self._sync_osk_buttons()
+
+    @staticmethod
+    def _sync_choice_buttons(buttons, current):
+        """고른 값의 버튼은 파란색, 나머지는 회색으로 보여준다."""
+        for value, btn in buttons.items():
+            if value == current:
+                btn.set_style(BLUE, BLUE_DARK, "white")
+            else:
+                btn.set_style(LINE, BLUE_SOFT_HOVER, TEXT_SUB, hover_fg=BLUE)
+
+    def _sync_osk_buttons(self):
+        self._sync_choice_buttons(self._osk_buttons, self.parent.osk_enabled())
+
+    def choose_button_size(self, key):
+        self.parent.set_main_button_size(key)
+        self._sync_size_buttons()
+
+    def _sync_size_buttons(self):
+        self._sync_choice_buttons(self._size_buttons, self.parent.main_button_size())
+
+    def on_camera_selected(self):
+        """고른 번호를 camera.txt에 저장하고, 캡처 스레드가 그 카메라로 다시 연결하게 한다."""
+        global ACTIVE_CAMERA_INDEX
+        index = self.cmb_camera.current()
+        save_preferred_camera_index(index)
+        ACTIVE_CAMERA_INDEX = None  # 새로 연결될 때까지 이전 번호를 보여주지 않는다
+        self.parent.camera_reopen = True
+        if not self.parent.camera_on:
+            self.parent.set_camera(True)
+        self.lbl_camera_info.config(text="연결 중...", fg="#64748B")
+        self.after(1500, self.show_camera_info)
+
+    def show_camera_info(self):
+        """실제로 연결된 번호를 보여준다. 고른 번호가 안 열려서 0번으로 넘어갔다면 그것도 알려준다."""
+        if not self.winfo_exists():
+            return
+        wanted = self.cmb_camera.current()
+        if self.parent.camera_error or not self.parent.camera_on:
+            text, color = ("● 연결 안 됨", "#EF4444") if self.parent.camera_error else ("", "#64748B")
+        elif ACTIVE_CAMERA_INDEX is None:
+            text, color = "연결 중...", "#64748B"
+            self.after(1000, self.show_camera_info)
+        elif ACTIVE_CAMERA_INDEX == wanted:
+            text, color = f"● {ACTIVE_CAMERA_INDEX}번 연결됨", "#10B981"
+        else:
+            text, color = f"● {wanted}번이 열리지 않아 {ACTIVE_CAMERA_INDEX}번 사용 중", "#F59E0B"
+        self.lbl_camera_info.config(text=text, fg=color)
 
     def refresh_roster_data(self):
         """
@@ -2462,14 +3118,14 @@ class AdminDashboardFrame(tk.Frame):
     def build_settings_tab(self):
         """메인 화면 복귀 시간 — 화면 묶음별로 5초 단위(5~60초)로 바꾸고, 누르는 즉시 저장한다."""
         card = RoundedPanel(self.tab_settings, fill=ADMIN_CARD, bg=ADMIN_BG, radius=px(18), outline=None,
-                            pad=px(34))
+                            pad=px(28))
         card.pack(fill=tk.BOTH, expand=True, padx=px(14), pady=px(14))
         b = card.body
         tk.Label(b, text="메인 화면 복귀 시간", font=(UI_FONT, 16, "bold"), bg=ADMIN_CARD, fg=TEXT) \
             .pack(anchor=tk.W)
         tk.Label(b, text=f"아무 조작이 없으면 이 시간 뒤에 메인 화면으로 돌아갑니다. "
                          f"{TIMEOUT_STEP}초 단위로 {TIMEOUT_MIN}~{TIMEOUT_MAX}초 사이에서 정할 수 있습니다.",
-                 font=(UI_FONT, 11), bg=ADMIN_CARD, fg=MUTED).pack(anchor=tk.W, pady=(px(6), px(24)))
+                 font=(UI_FONT, 11), bg=ADMIN_CARD, fg=MUTED).pack(anchor=tk.W, pady=(px(4), px(16)))
 
         self._timeout_labels = {}
         self._timeout_buttons = {}
@@ -2478,8 +3134,8 @@ class AdminDashboardFrame(tk.Frame):
             ("result", "출퇴근 결과 화면", "\"OOO 학생 출근 되었습니다\" 화면이 떠 있는 시간"),
             ("stats", "출석 현황 화면", "이번 주 출석 현황이 떠 있는 시간"),
         ):
-            row = RoundedBox(b, fill=PANEL_ALT, bg=ADMIN_CARD, radius=px(14), pad=px(18))
-            row.pack(fill=tk.X, pady=(0, px(12)))
+            row = RoundedBox(b, fill=PANEL_ALT, bg=ADMIN_CARD, radius=px(14), pad=px(12))
+            row.pack(fill=tk.X, pady=(0, px(8)))
             r = row.body
             text = tk.Frame(r, bg=PANEL_ALT)
             text.pack(side=tk.LEFT)
@@ -2496,6 +3152,35 @@ class AdminDashboardFrame(tk.Frame):
             self._timeout_labels[name] = lbl
             self._timeout_buttons[name] = (minus, plus)
             self._show_timeout(name)
+
+        # 메인 화면 출근/퇴근 버튼 크기 · 화면 키보드 — 고르면 바로 저장되고 반영된다
+        tk.Label(b, text="화면", font=(UI_FONT, 16, "bold"), bg=ADMIN_CARD, fg=TEXT) \
+            .pack(anchor=tk.W, pady=(px(14), px(10)))
+        choice = dict(height=px(46), font=(UI_FONT, 12, "bold"), bg=PANEL_ALT, padx=px(24))
+
+        def choice_row(title, desc, options, command):
+            row = RoundedBox(b, fill=PANEL_ALT, bg=ADMIN_CARD, radius=px(14), pad=px(12))
+            row.pack(fill=tk.X, pady=(0, px(8)))
+            r = row.body
+            text = tk.Frame(r, bg=PANEL_ALT)
+            text.pack(side=tk.LEFT)
+            tk.Label(text, text=title, font=(UI_FONT, 13, "bold"), bg=PANEL_ALT, fg=TEXT).pack(anchor=tk.W)
+            tk.Label(text, text=desc, font=(UI_FONT, 10), bg=PANEL_ALT, fg=TEXT_SUB).pack(anchor=tk.W)
+            buttons = {}
+            for value, label in reversed(options):  # 오른쪽부터 쌓이므로 거꾸로
+                btn = RoundButton(r, text=label, command=lambda v=value: command(v), **choice)
+                btn.pack(side=tk.RIGHT, padx=(px(8), 0))
+                buttons[value] = btn
+            return buttons
+
+        self._size_buttons = choice_row(
+            "메인 화면 버튼 크기", "출근 · 퇴근 카드의 크기",
+            [(key, label) for key, (label, _scale) in MAIN_BUTTON_SIZES.items()], self.choose_button_size)
+        self._sync_size_buttons()
+        self._osk_buttons = choice_row(
+            "화면 키보드", "터치스크린에서 입력칸을 누르면 화면에 키보드를 띄운다",
+            [(True, "켬"), (False, "끔")], self.choose_osk)
+        self._sync_osk_buttons()
 
     def _show_timeout(self, name):
         value = timeouts[name]
@@ -2516,6 +3201,22 @@ class AdminDashboardFrame(tk.Frame):
         self._show_timeout(name)
 
     def build_add_student_tab(self):
+        # 카메라 장치 선택 — 외장 USB 카메라를 쓸 때 번호를 바꾼다 (노트북 내장 0번, 외장은 보통 1번).
+        # 카메라는 이 탭에서만 켜지므로 바꾼 결과를 왼쪽 화면에서 바로 확인할 수 있다.
+        cam_bar = tk.Frame(self.tab_add_student, bg="white")
+        cam_bar.pack(fill=tk.X, padx=px(10), pady=(px(10), 0))
+        tk.Label(cam_bar, text="카메라 장치:", font=(UI_FONT, 10, "bold"), bg="white", fg="#334155") \
+            .pack(side=tk.LEFT, padx=(px(10), 0), pady=px(8))
+        self.camera_choices = [f"{i}번" for i in range(5)]
+        self.cmb_camera = ttk.Combobox(cam_bar, state="readonly", width=6, font=(UI_FONT, 10),
+                                       values=self.camera_choices)
+        saved = preferred_camera_index()
+        self.cmb_camera.current(saved if saved is not None and saved < len(self.camera_choices) else 0)
+        self.cmb_camera.pack(side=tk.LEFT, padx=(px(8), px(8)))
+        self.cmb_camera.bind("<<ComboboxSelected>>", lambda e: self.on_camera_selected())
+        self.lbl_camera_info = tk.Label(cam_bar, text="", font=(UI_FONT, 10), bg="white", fg="#64748B")
+        self.lbl_camera_info.pack(side=tk.LEFT)
+
         frame = ttk.LabelFrame(self.tab_add_student, text=" 학생 얼굴 및 상세 정보 등록 ")
         frame.pack(fill=tk.BOTH, expand=True, padx=px(10), pady=px(10))
 
@@ -3048,7 +3749,7 @@ class AdminDashboardFrame(tk.Frame):
             messagebox.showerror(
                 "얼굴 인식 실패",
                 "사람 얼굴이 아닌 것으로 보입니다.\n"
-                "등록할 학생이 카메라를 바라보고 눈을 한 번 깜빡인 뒤 다시 눌러주세요.",
+                "등록할 학생이 카메라를 바라보고 눈을 천천히 감았다 뜬 뒤 다시 눌러주세요.",
             )
             return
 
@@ -3197,7 +3898,8 @@ class AttendanceApp:
         self.ai_failed = False          # 모델을 받지 못했거나 인식 프로세스가 죽었는지
         self.camera_on = False          # 캡처 스레드가 이 값에 맞춰 카메라 장치를 열고 닫는다
         self.camera_error = False
-        self.camera_generation = 0      # 카메라를 켜고 끌 때마다 1씩 증가 — 이전 세션의 늦은 인식 결과를 버리는 데 쓴다
+        self.camera_reopen = False      # True면 캡처 스레드가 카메라를 닫고 camera.txt의 번호로 다시 연다
+        self.camera_generation = 0     # 카메라를 켜고 끌 때마다 1씩 증가 — 이전 세션의 늦은 인식 결과를 버리는 데 쓴다
 
         # 사진/영상 판별용 깜빡임 상태 (인식 프로세스가 깜빡임 값을 보내주면 켜진다)
         self.liveness_enabled = False
@@ -3212,6 +3914,8 @@ class AttendanceApp:
 
         # UI 레이아웃 구성
         self.create_widgets()
+        # 입력칸을 누르면 뜨는 화면 키보드 — 라즈베리파이(터치스크린)는 기본으로 켜고, 관리자 화면에서 끄고 켤 수 있다
+        self.osk = OnScreenKeyboard(self.window, self.osk_enabled)
 
         # macOS 카메라 권한은 앱을 켤 때 미리 받아둔다 (처음 한 번만 허용 창이 뜬다).
         # 카메라 장치 자체는 출근/퇴근 버튼을 눌렀을 때 캡처 스레드가 연다.
@@ -3229,6 +3933,7 @@ class AttendanceApp:
         # 화면 그리기 상태 (PhotoImage를 매 프레임 새로 만들지 않고 재사용한다)
         self._photo = None
         self._rendered_seq = -1
+        self._last_render_time = 0.0
         self._fps_count = 0
         self._fps_since = time.perf_counter()
 
@@ -3342,17 +4047,45 @@ class AttendanceApp:
         center = tk.Frame(self.idle_view, bg=BG)
         center.place(relx=0.5, rely=0.5, anchor=tk.CENTER)
 
-        card_w, card_h, gap = px(660), px(478), px(46)
-        btn_row = tk.Frame(center, bg=BG)
-        btn_row.pack()
-        for i, log_type in enumerate(("CHECK_IN", "CHECK_OUT")):
-            ActionCard(btn_row, log_type, lambda t=log_type: self.start_attendance(t), card_w, card_h) \
-                .pack(side=tk.LEFT, padx=(0 if i == 0 else gap, 0))
+        # 출근/퇴근 카드 — 관리자 화면에서 크기를 바꾸면 이 안만 다시 만든다
+        self._action_cards = tk.Frame(center, bg=BG)
+        self._action_cards.pack()
+        self._build_action_cards()
 
         # 얼굴 인식 준비 상태 — 처음 실행하면 모델(약 300MB)을 받느라 몇 분 걸린다 (_update_clock에서 갱신)
         self.lbl_ai_status = tk.Label(center, text="", font=(UI_FONT, 11, "bold"), bg=BG, fg=WARN,
                                       justify=tk.CENTER)
         self.lbl_ai_status.pack(pady=(px(14), 0))
+
+    def main_button_size(self):
+        """메인 화면 버튼 크기 설정 (MAIN_BUTTON_SIZES의 키). 저장된 값이 이상하면 기본값."""
+        key = load_settings().get("main_button_size", DEFAULT_MAIN_BUTTON_SIZE)
+        return key if key in MAIN_BUTTON_SIZES else DEFAULT_MAIN_BUTTON_SIZE
+
+    def osk_enabled(self):
+        """화면 키보드를 쓸지. 저장된 값이 없으면 라즈베리파이(터치스크린 키오스크)에서만 켠다."""
+        return bool(load_settings().get("on_screen_keyboard", IS_RASPBERRY_PI))
+
+    def set_osk_enabled(self, enabled):
+        save_setting("on_screen_keyboard", bool(enabled))
+        if not enabled:
+            self.osk.hide()
+
+    def set_main_button_size(self, key):
+        """관리자 화면에서 고른 크기를 저장하고 메인 화면 카드를 바로 다시 만든다."""
+        save_setting("main_button_size", key)
+        self._build_action_cards()
+
+    def _build_action_cards(self):
+        for widget in self._action_cards.winfo_children():
+            widget.destroy()
+        # 기본 디자인(470x340)에 배율을 곱한다 — 카드 안 글자·아이콘도 같은 비율로 커진다
+        card_scale = MAIN_BUTTON_SIZES[self.main_button_size()][1]
+        card_w, card_h, gap = px(470 * card_scale), px(340 * card_scale), px(24 * card_scale)
+        for i, log_type in enumerate(("CHECK_IN", "CHECK_OUT")):
+            ActionCard(self._action_cards, log_type, lambda t=log_type: self.start_attendance(t),
+                       card_w, card_h, scale=card_scale) \
+                .pack(side=tk.LEFT, padx=(0 if i == 0 else gap, 0))
 
     def capture_worker(self):
         """
@@ -3361,35 +4094,56 @@ class AttendanceApp:
         꺼져 있을 때는 장치를 완전히 닫아서 카메라 불도 꺼진다.
         """
         cap = None
+        last_frame_time = 0.0
         while self.is_running:
-            if not self.camera_on:
+            try:
+                if self.camera_reopen:  # 관리자 화면에서 다른 카메라를 골랐다 — 닫고 새 번호로 다시 연다
+                    self.camera_reopen = False
+                    if cap is not None:
+                        cap.release()
+                        cap = None
+
+                if not self.camera_on:
+                    if cap is not None:
+                        cap.release()
+                        cap = None
+                    time.sleep(0.05)
+                    continue
+
+                if cap is None:
+                    # 실제로 영상이 나오는 장치를 찾는다 (USB가 다시 붙으며 번호가 바뀐 경우까지)
+                    cap = open_working_camera(640, 480, CAMERA_FPS)
+                    if cap is None:
+                        self.camera_error = True
+                        time.sleep(1.0)  # 다른 프로그램이 놓아줄 수도 있으니 켜져 있는 동안 1초마다 다시 시도
+                        continue
+                    self.camera_error = False
+                    last_frame_time = time.time()
+
+                ret, frame = cap.read()
+                if not ret:
+                    # 과부하·전원 부족으로 USB 카메라가 잠깐 끊기면 읽기가 계속 실패한 채로 멈춘다.
+                    # 예전에는 여기서 영영 재시도만 해서 프로그램을 껐다 켜야 했다 — 닫고 다시 연결한다.
+                    if time.time() - last_frame_time > CAMERA_STALL_SECONDS:
+                        print(f"[출석] 카메라에서 {CAMERA_STALL_SECONDS:.0f}초간 영상이 오지 않아 다시 연결합니다.")
+                        cap.release()
+                        cap = None
+                        self.camera_error = True
+                    else:
+                        time.sleep(0.02)
+                    continue
+                last_frame_time = time.time()
+                if self.camera_on:  # 읽는 사이에 꺼졌다면 버린다
+                    self.latest_frame = cv2.flip(frame, 1)
+                    self.frame_seq += 1
+            except Exception as e:
+                # 여기서 스레드가 죽으면 카메라를 영영 못 쓴다 — 장치를 닫고 다음 바퀴에 새로 연다
+                print(f"[출석] 카메라 처리 중 오류가 있었지만 계속 진행합니다 ({type(e).__name__}: {e})")
                 if cap is not None:
                     cap.release()
                     cap = None
-                time.sleep(0.05)
-                continue
-
-            if cap is None:
-                cap = open_camera(0)  # OS별로 맞는 백엔드를 고른다 (open_camera 참고)
-                if not cap.isOpened():
-                    cap.release()
-                    cap = None
-                    self.camera_error = True
-                    time.sleep(1.0)  # 다른 프로그램이 놓아줄 수도 있으니 켜져 있는 동안 1초마다 다시 시도
-                    continue
-                self.camera_error = False
-                cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
-                cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
-                cap.set(cv2.CAP_PROP_FPS, 30)
-                cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)  # 밀린 옛 프레임 대신 항상 최신 프레임
-
-            ret, frame = cap.read()
-            if not ret:
-                time.sleep(0.01)
-                continue
-            if self.camera_on:  # 읽는 사이에 꺼졌다면 버린다
-                self.latest_frame = cv2.flip(frame, 1)
-                self.frame_seq += 1
+                self.camera_error = True
+                time.sleep(1.0)
 
         if cap is not None:
             cap.release()
@@ -3407,8 +4161,13 @@ class AttendanceApp:
                 # 같은 프레임을 두 번 분석하지 않는다 (관리자 탭에서도 학생 등록용 스캔은 계속 유지)
                 if self.camera_on and frame is not None and seq != last_seq:
                     last_seq = seq
+                    started = time.time()
                     self.face_conn.send(frame)
                     results, blink_score, liveness = self.face_conn.recv()
+                    # 느린 기기(라즈베리파이)에서는 분석 사이에 잠깐 쉬어서 카메라·화면이 CPU를 쓸 틈을 준다
+                    rest = AI_MIN_INTERVAL - (time.time() - started)
+                    if rest > 0:
+                        time.sleep(rest)
                     # 분석하는 사이에 카메라를 껐다 켰다면(다음 사람) 예전 얼굴 결과는 버린다
                     if self.camera_on and generation == self.camera_generation:
                         self.cached_faces = [DetectedFace(bbox, emb) for bbox, emb in results]
@@ -3484,10 +4243,18 @@ class AttendanceApp:
         frame = self.latest_frame
         seq = self.frame_seq
 
-        # 새 프레임이 들어왔을 때만 그린다 — 같은 프레임을 다시 그리는 CPU 낭비 방지
-        if self.camera_on and frame is not None and seq != self._rendered_seq:
+        # 새 프레임이 들어왔을 때만 그린다 — 같은 프레임을 다시 그리는 CPU 낭비 방지.
+        # 느린 기기는 초당 DISPLAY_FPS번까지만 그린다 (화면 그리기가 라즈베리파이 과부하의 큰 원인이었다)
+        now = time.time()
+        render_due = DISPLAY_FPS is None or now - self._last_render_time >= 1.0 / DISPLAY_FPS
+        if self.camera_on and frame is not None and seq != self._rendered_seq and render_due:
             self._rendered_seq = seq
+            self._last_render_time = now
             self._render_frame(frame)
+        elif self.camera_on and self.camera_error and self._photo is not None:
+            # 영상이 나오다 끊긴 경우 — 다시 연결하는 동안 마지막 화면은 두고 상태만 알린다
+            if self.lbl_cam_status.cget("text") != "● 카메라 다시 연결 중...":
+                self.lbl_cam_status.config(text="● 카메라 다시 연결 중...", fg="#FBBF24")
         elif self.camera_on and self.camera_error and self._photo is None:
             msg = "📷\n\n카메라를 열 수 없습니다\n다른 프로그램이 카메라를 쓰고 있는지 확인하세요"
             if IS_MAC:
@@ -3620,7 +4387,7 @@ class AttendanceApp:
         elif self.passes_antispoof() and self.has_recent_blink():
             self.lbl_liveness.config(text="·  사람 확인됨 (눈 깜빡임 확인)", fg="#86EFAC")
         elif not self.has_recent_blink():
-            self.lbl_liveness.config(text="·  눈을 깜빡여 주세요", fg="#94A3B8")
+            self.lbl_liveness.config(text="·  눈을 천천히 감았다 떠 주세요", fg="#94A3B8")
         else:
             self.lbl_liveness.config(text="·  카메라를 바라봐 주세요", fg="#94A3B8")
 
@@ -3650,7 +4417,7 @@ class AttendanceApp:
             self._candidate_id = matched_user["user_id"]
             self._candidate_since = now
         if now - self._candidate_since < RECOGNIZE_HOLD_SECONDS:
-            card.set_state("blink", checking, "눈을 한 번 깜빡여 주세요")
+            card.set_state("blink", checking, "눈을 천천히 감았다 떠 주세요")
             return
         if not self.passes_antispoof():
             if (now - self.last_fake_time) <= LIVENESS_VALID_SECONDS:
@@ -3661,7 +4428,7 @@ class AttendanceApp:
                 card.set_state("warn", checking, "카메라를 정면으로 바라봐 주세요")
             return
         if not self.has_recent_blink():
-            card.set_state("blink", checking, "눈을 한 번 깜빡여 주세요")
+            card.set_state("blink", checking, "눈을 천천히 감았다 떠 주세요")
             return
 
         # 확인 완료 — 출근/퇴근이면 기록한다 (출석 조회는 조회만). 사진은 남기지 않는다.
@@ -4016,8 +4783,24 @@ if __name__ == "__main__":
     # --prepare : 얼굴 인식·위조판별·깜빡임 모델을 미리 내려받고 끝낸다 (설치할 때 한 번)
     if "--prepare" in sys.argv:
         create_face_app()
-        ready = create_blink_detector() is not None
-        print(f"[출석] 모델 준비 완료 (깜빡임 검사: {'사용' if ready else '사용 안 함'})")
+        if not blink_mode_forced_to_landmark() and create_blink_detector() is not None:
+            blink_status = "사용 (mediapipe)"
+        elif create_landmark_blink_meter() is not None:
+            blink_status = "사용 (얼굴 윤곽 모델)"
+        else:
+            blink_status = "사용 안 함"
+        print(f"[출석] 모델 준비 완료 (깜빡임 검사: {blink_status})")
+        sys.exit(0)
+
+    # --list-cameras : 연결된 카메라 번호를 확인한다. exe는 콘솔이 없어서 창으로도 보여준다.
+    if "--list-cameras" in sys.argv:
+        result = list_cameras()
+        message = ("카메라 번호별 확인\n\n" + "\n".join(result) +
+                   "\n\n쓸 카메라 번호를 프로그램 폴더의 camera.txt 에 숫자만 적어 저장하세요. (예: 1)")
+        print(message)
+        _root = tk.Tk()
+        _root.withdraw()
+        messagebox.showinfo("창의공간 출석체크 - 카메라 확인", message)
         sys.exit(0)
 
     # --scheduled : 작업 스케줄러/시작프로그램이 띄운 경우. 00:00~06:00이면 켜지 않고, 자정에 스스로 종료한다.

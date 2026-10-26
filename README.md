@@ -182,9 +182,8 @@ VS Code 등 다른 앱에서 실행하면 그 앱에도 권한이 있어야 합�
 | `LIVENESS_VALID_SECONDS` | 3초 | 출결 전 실제 사람 판정 유효 시간 |
 | `BLINK_CLOSED_SCORE` / `BLINK_OPEN_SCORE` | 0.5 / 0.3 | 눈 감음/뜸 판정 기준 |
 | `BLINK_VALID_SECONDS` | 10초 | 출결 전 깜빡임 유효 시간 |
-| `SESSION_TIMEOUT` | 30초 | 출근/퇴근을 누른 뒤 얼굴 확인을 기다리는 시간 |
+| `TIMEOUT_DEFAULTS` | 30초 / 10초 / 20초 | 얼굴 확인(출근·퇴근·출석 조회) / 결과 화면 / 출석 현황 화면이 메인으로 돌아가는 기본 시간. 관리자 [설정] 탭에서 5초 단위(5~60초)로 바꿀 수 있다 |
 | `RECOGNIZE_HOLD_SECONDS` | 0.6초 | 같은 학생이 이 시간 동안 계속 인식돼야 기록 |
-| `RESULT_POPUP_SECONDS` / `STATS_POPUP_SECONDS` | 3초 / 20초 | 결과 안내창 / 출석 조회 창 자동 닫힘 |
 | `PHOTO_DIR` | `attendance_photos/` | 출퇴근 사진 저장 폴더 |
 | `PHOTO_WIDTH` / `PHOTO_JPEG_QUALITY` | 320px / 70 | 사진 해상도·화질 |
 | `PHOTO_RETENTION_DAYS` | 90일 | 사진 보관 기간 (지나면 자동 삭제) |

@@ -857,7 +857,14 @@ GOOGLE_FORM_COLUMNS = {
     "Name": ("이름", "성명"),
     "Department": ("전공", "학과"),
     "Phone": ("전화", "연락처", "휴대폰"),
+    "Grade": ("학년",),
 }
+
+
+def normalize_grade(value):
+    """학년 응답에서 숫자만 남긴다 ("2학년" → "2", "3 학년" → "3"). 숫자가 없으면 빈 문자열."""
+    digits = "".join(ch for ch in str(value or "") if ch.isdigit())
+    return digits[:1]
 
 
 def roster_from_rows(rows):
@@ -3517,7 +3524,7 @@ class AdminDashboardFrame(tk.Frame):
         self._show_timeout(name)
 
     # 학생 등록 입력칸 — (키, 제목)
-    ADD_FIELDS = (("id", "학번"), ("name", "이름"), ("major", "전공"), ("phone", "전화번호"))
+    ADD_FIELDS = (("id", "학번"), ("name", "이름"), ("major", "전공"), ("phone", "전화번호"), ("grade", "학년"))
 
     def build_add_student_tab(self):
         tab = self.tab_add_student
@@ -3635,6 +3642,8 @@ class AdminDashboardFrame(tk.Frame):
             self._roster = result["roster"]
             self.parent.apply_roster(self._roster)
             self.reload_roster_combo()
+            if self._fill_blanks_from_roster():
+                self.load_students()
             live = f" · {ROSTER_REFRESH_SECONDS}초마다 자동 갱신" if result["source"] == "구글 시트" else ""
             self.lbl_roster_status.config(
                 text=f"● {result['source']} 명단 {len(self._roster)}명 · 미등록 {len(self._roster_map)}명 "
@@ -3678,6 +3687,29 @@ class AdminDashboardFrame(tk.Frame):
                     f"인터넷 연결과 [설정] 탭의 구글폼 응답 주소를 확인해주세요.\n\n{error}")
         return f"명단을 불러오는 중 오류가 발생했습니다.\n\n{error}"
 
+    def _fill_blanks_from_roster(self):
+        """
+        이미 등록된 학생 중 전화번호·학년이 비어 있으면 명단(구글폼 응답) 값으로 채운다.
+        관리자가 직접 입력한 값은 덮어쓰지 않는다. 바뀐 학생 수를 돌려준다.
+        """
+        by_id = {str(s.get("StudentId", "")).strip(): s for s in self._roster}
+        conn = sqlite3.connect(DB_PATH)
+        cursor = conn.cursor()
+        cursor.execute("SELECT user_id, phone, grade FROM users WHERE role = 'student' AND (phone = '' OR grade = '')")
+        changed = 0
+        for user_id, phone, grade in cursor.fetchall():
+            student = by_id.get(str(user_id))
+            if not student:
+                continue
+            new_phone = phone or str(student.get("Phone") or "").strip()
+            new_grade = grade or normalize_grade(student.get("Grade"))
+            if (new_phone, new_grade) != (phone, grade):
+                cursor.execute("UPDATE users SET phone = ?, grade = ? WHERE user_id = ?", (new_phone, new_grade, user_id))
+                changed += 1
+        conn.commit()
+        conn.close()
+        return changed
+
     def reload_roster_combo(self):
         """받아 둔 명단에서 아직 등록 안 된 학생만 목록에 채운다."""
         conn = sqlite3.connect(DB_PATH)
@@ -3706,8 +3738,11 @@ class AdminDashboardFrame(tk.Frame):
         if not student:
             return
         self.clear_add_form()
-        for key, field in (("id", "StudentId"), ("name", "Name"), ("major", "Department"), ("phone", "Phone")):
+        for key, field in (("id", "StudentId"), ("name", "Name"), ("major", "Department"), ("phone", "Phone"),
+                           ("grade", "Grade")):
             value = str(student.get(field) or "").strip()
+            if key == "grade":
+                value = normalize_grade(value)
             if value:
                 self.add_entries[key].delete(0, tk.END)
                 self.add_entries[key].insert(0, value)
@@ -4138,6 +4173,7 @@ class AdminDashboardFrame(tk.Frame):
     def register_student(self):
         values = {key: entry.get().strip() for key, entry in self.add_entries.items()}
         s_id, name, phone = values["id"], values["name"], values["phone"]
+        grade = normalize_grade(values["grade"])
         major = values["major"] or DEPARTMENT_NAME
 
         if not (s_id and name):
@@ -4183,9 +4219,9 @@ class AdminDashboardFrame(tk.Frame):
 
         emb = new_embedding.tobytes()
         cursor.execute("""
-            INSERT INTO users (user_id, name, major, role, embedding, penalty, phone)
-            VALUES (?, ?, ?, ?, ?, 0, ?)
-        """, (s_id, name, major, 'student', emb, phone))
+            INSERT INTO users (user_id, name, major, role, embedding, penalty, phone, grade)
+            VALUES (?, ?, ?, ?, ?, 0, ?, ?)
+        """, (s_id, name, major, 'student', emb, phone, grade))
         conn.commit()
         conn.close()
 

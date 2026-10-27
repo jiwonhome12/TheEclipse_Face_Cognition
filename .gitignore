@@ -133,3 +133,8 @@ settings.json
 .vs/
 .vscode/
 .idea/
+
+# 구글 Sheets API 서비스 계정 키 (비밀 키 — 절대 올리지 않는다)
+google_service_account.json
+# 구글 콘솔에서 받은 원본 키 파일 (이름이 "<프로젝트ID>-<12자리>.json")
+*-????????????.json

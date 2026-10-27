@@ -965,21 +965,88 @@ def load_sheets_api_roster(sheet_id, timeout=10):
     return roster_from_rows(resp.json().get("values", []))
 
 
+# [설정]의 '학생 명단 출처' — 학생 등록 목록을 어디서 가져올지
+ROSTER_SOURCES = {"seat": "창공시스템", "google": "구글폼"}
+DEFAULT_ROSTER_SOURCE = "seat"  # 창공시스템 명단이 기준이다
+
+
+def roster_source():
+    value = load_settings().get("roster_source")
+    return value if value in ROSTER_SOURCES else DEFAULT_ROSTER_SOURCE
+
+
+def load_google_roster(url):
+    """구글 시트 주소(…/spreadsheets/d/<ID>/…)면 Sheets API로, 웹에 게시한 CSV 주소면 그 CSV로 읽는다."""
+    sheet_id = google_sheet_id(url)
+    if sheet_id:
+        return load_sheets_api_roster(sheet_id)
+    return load_google_form_roster(url)
+
+
+def merge_roster_fields(base, extra):
+    """
+    같은 학번끼리 base의 빈 칸을 extra 값으로 채운다 (두 명단의 항목 합집합).
+    학생 목록 자체는 base 그대로다 — extra에만 있는 학생은 넣지 않는다.
+    """
+    by_id = {str(s.get("StudentId", "")).strip(): s for s in extra}
+    for student in base:
+        other = by_id.get(str(student.get("StudentId", "")).strip())
+        if not other:
+            continue
+        for field, value in other.items():
+            if value and not str(student.get(field) or "").strip():
+                student[field] = value
+    return base
+
+
 def load_student_roster():
     """
-    학생 등록에 쓰는 명단과 그 출처 이름. 설정의 주소가
-      - 구글 시트 주소(…/spreadsheets/d/<ID>/…)면 Sheets API로 (서비스 계정 키 필요, 시트 공개 안 해도 됨)
-      - 웹에 게시한 CSV 주소면 그 CSV로
-      - 비어 있으면 창공시스템 roster.json에서 읽는다.
+    학생 등록에 쓰는 명단과 그 출처 이름. [설정]의 '학생 명단 출처'가
+      - 창공시스템이면 roster.json에서 읽는다. 구글폼 주소도 넣어 두었으면 비어 있는 칸(학년 등)을
+        구글폼 응답으로 채운다 (구글폼을 못 읽어도 창공시스템 명단은 그대로 쓴다).
+      - 구글폼이면 설정의 주소에서 읽는다 (구글 시트 주소면 Sheets API, CSV 게시 주소면 CSV).
     읽지 못하면 예외를 그대로 올린다.
     """
     url = str(load_settings().get("google_form_csv_url", "")).strip()
+    if roster_source() == "google":
+        if not url:
+            raise ValueError("[설정] 탭의 '구글폼 학생 명단 주소'가 비어 있습니다.\n"
+                             "주소를 넣거나 '학생 명단 출처'를 창공시스템으로 바꿔주세요.")
+        return load_google_roster(url), "구글 시트" if google_sheet_id(url) else "구글폼"
+    roster = load_roster_strict()
     if url:
-        sheet_id = google_sheet_id(url)
-        if sheet_id:
-            return load_sheets_api_roster(sheet_id), "구글 시트"
-        return load_google_form_roster(url), "구글폼"
-    return load_roster_strict(), "창공시스템"
+        try:
+            merge_roster_fields(roster, load_google_roster(url))
+        except Exception:
+            pass  # 구글폼은 빈 칸을 채우는 보조 명단일 뿐이다
+    return roster, "창공시스템"
+
+
+def find_removed_students(roster):
+    """
+    얼굴인식에 등록된 학생 중 창공시스템 명단(roster.json)에 학번이 없는 학생 [(학번, 이름), ...].
+    창공시스템에서 삭제된 학생을 알려주는 데 쓴다. 명단이 비어 있으면(아직 내보내기 전이거나 파일이 깨진 경우)
+    등록 학생 전원이 '삭제됨'으로 나오지 않도록 빈 목록을 돌려준다.
+    """
+    roster_ids = {str(s.get("StudentId", "")).strip() for s in roster} - {""}
+    if not roster_ids:
+        return []
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    cursor.execute("SELECT user_id, name FROM users WHERE role = 'student' ORDER BY user_id")
+    rows = cursor.fetchall()
+    conn.close()
+    return [(str(user_id), name) for user_id, name in rows if str(user_id) not in roster_ids]
+
+
+def removed_students_message(removed, limit=10):
+    """find_removed_students 결과를 알림 창에 보여줄 글로 만든다."""
+    lines = [f"  {user_id}  {name}" for user_id, name in removed[:limit]]
+    if len(removed) > limit:
+        lines.append(f"  … 외 {len(removed) - limit}명")
+    return (f"창공시스템 명단에서 삭제된 학생 {len(removed)}명이 얼굴인식에 아직 등록되어 있습니다.\n\n"
+            + "\n".join(lines)
+            + "\n\n관리자 화면 [학생 현황/수정]에서 확인 후 필요하면 삭제해주세요.")
 
 
 def pair_attendance_sessions(rows):
@@ -1663,8 +1730,10 @@ class OnScreenKeyboard:
         self.comp_start = 0
         self.comp_len = 0
         self.dismissed = None       # [완료]로 닫은 입력칸 — 다시 누르기 전까지는 키보드를 띄우지 않는다
-        root.bind_class("TEntry", "<FocusIn>", self._on_focus, add="+")
-        root.bind_class("TEntry", "<Button-1>", self._on_entry_click, add="+")
+        # tk.Entry(Entry)와 ttk.Entry(TEntry) 둘 다 — 화면 디자인이 바뀌며 입력칸 종류가 바뀌어도 키보드가 뜨게
+        for widget_class in ("Entry", "TEntry"):
+            root.bind_class(widget_class, "<FocusIn>", self._on_focus, add="+")
+            root.bind_class(widget_class, "<Button-1>", self._on_entry_click, add="+")
 
     # ---------- 보이기 / 숨기기 ----------
     def _on_focus(self, event):
@@ -1685,11 +1754,14 @@ class OnScreenKeyboard:
         self.show()
 
     def _on_entry_click(self, event):
-        if event.widget is self.target:
+        if event.widget is self.dismissed:
+            self.dismissed = None  # [완료]로 닫은 칸을 다시 누르면 키보드를 다시 띄운다
+        if event.widget is self.target and self.panel is not None and self.panel.winfo_exists() \
+                and self.panel.winfo_ismapped():
             self.commit()  # 입력칸을 눌러 커서를 옮기면 조합 중이던 글자는 확정한다
-        elif event.widget is self.dismissed:
-            # [완료]로 닫은 칸을 다시 누르면 키보드를 다시 띄운다
-            self.dismissed = None
+        else:
+            # 누르면 항상 뜨게 한다 — 다른 창이 앞에 있으면 OS가 커서(포커스)를 안 넘겨줘서
+            # '입력칸 선택' 신호만으로는 키보드가 안 뜨는 경우가 있었다
             self._on_focus(event)
 
     def show(self):
@@ -3136,6 +3208,14 @@ class AdminDashboardFrame(tk.Frame):
     def _sync_size_buttons(self):
         self._sync_choice_buttons(self._size_buttons, self.parent.main_button_size())
 
+    def choose_roster_source(self, key):
+        save_setting("roster_source", key)
+        self._sync_roster_source_buttons()
+        self._fetch_roster(show_message=True)  # 바로 읽어 봐서 새 출처가 되는지 알려준다
+
+    def _sync_roster_source_buttons(self):
+        self._sync_choice_buttons(self._roster_source_buttons, roster_source())
+
     def on_camera_selected(self):
         """고른 번호를 camera.txt에 저장하고, 캡처 스레드가 그 카메라로 다시 연결하게 한다."""
         global ACTIVE_CAMERA_INDEX
@@ -3455,6 +3535,12 @@ class AdminDashboardFrame(tk.Frame):
         self.lbl_camera_info = tk.Label(right, text="", font=(UI_FONT, 10), bg=ADMIN_CARD, fg=MUTED)
         self.lbl_camera_info.pack(anchor=tk.E, pady=(0, px(6)))
 
+        # 학생 명단 출처 — 창공시스템(roster.json) 또는 구글폼 응답 시트
+        self._roster_source_buttons = choice_buttons(
+            setting_row(right, "학생 명단 출처", "[학생 등록] 목록을 가져올 곳"),
+            list(ROSTER_SOURCES.items()), self.choose_roster_source)
+        self._sync_roster_source_buttons()
+
         # 학생 명단 — 구글폼 응답 시트를 CSV로 웹에 게시한 주소 ([학생 등록]의 구글폼 학생 명단)
         # 서비스 계정 키 — 이 계정에 응답 시트를 '뷰어'로 공유하면 시트를 공개하지 않고 읽는다
         r = setting_row(right, "서비스 계정 키", "")
@@ -3471,7 +3557,8 @@ class AdminDashboardFrame(tk.Frame):
                                      fg=TEXT, highlightthickness=0, width=10)
         self.ent_form_url.pack(fill=tk.X)
         self.ent_form_url.insert(0, str(load_settings().get("google_form_csv_url", "")))
-        tk.Label(right, text="시트 주소를 넣으면 Sheets API로 실시간으로 읽고, 비워 두면 창공시스템 명단(roster.json)을 씁니다.",
+        tk.Label(right, text="출처가 구글폼이면 이 주소에서 명단을 읽습니다. 출처가 창공시스템이어도 주소를 넣어 두면 "
+                             "창공시스템 명단에 없는 칸(학년 등)을 구글폼 응답으로 채웁니다.",
                  wraplength=px(620), justify=tk.LEFT, font=(UI_FONT, 10),
                  bg=ADMIN_CARD, fg=MUTED).pack(anchor=tk.W, pady=(px(6), 0))
 
@@ -3550,8 +3637,8 @@ class AdminDashboardFrame(tk.Frame):
         form.pack(fill=tk.X)
         form.columnconfigure((0, 1), weight=1, uniform="half")
 
-        # 구글폼 응답(설정 탭에서 주소 입력)에서 골라서 자동 입력 — 수기로 다시 안 쳐도 된다
-        admin_field_label(form, "구글폼 학생 명단").grid(row=0, column=0, columnspan=2, sticky=tk.W,
+        # 명단(설정 탭의 '학생 명단 출처')에서 골라서 자동 입력 — 수기로 다시 안 쳐도 된다
+        admin_field_label(form, "학생 명단").grid(row=0, column=0, columnspan=2, sticky=tk.W,
                                                      pady=(0, px(4)))
         pick = tk.Frame(form, bg=ADMIN_CARD)
         pick.grid(row=1, column=0, columnspan=2, sticky=tk.EW)
@@ -3573,13 +3660,17 @@ class AdminDashboardFrame(tk.Frame):
         self.lbl_roster_status = tk.Label(form, text="명단을 불러오는 중...", font=(UI_FONT, 10), bg=ADMIN_CARD,
                                           fg=MUTED, anchor=tk.W)
         self.lbl_roster_status.grid(row=2, column=0, columnspan=2, sticky=tk.W, pady=(px(6), 0))
+        # 고른 학생의 입력칸이 없는 항목(지도교수 · 이메일 등) — 명단에 있는 정보는 모두 보여준다
+        self.lbl_roster_extra = tk.Label(form, text="", font=(UI_FONT, 10), bg=ADMIN_CARD, fg=TEXT_SUB,
+                                         anchor=tk.W, justify=tk.LEFT, wraplength=px(560))
+        self.lbl_roster_extra.grid(row=3, column=0, columnspan=2, sticky=tk.W, pady=(px(4), 0))
 
-        tk.Frame(form, bg=LINE, height=1).grid(row=3, column=0, columnspan=2, sticky=tk.EW, pady=px(18))
+        tk.Frame(form, bg=LINE, height=1).grid(row=4, column=0, columnspan=2, sticky=tk.EW, pady=px(18))
 
         # 학번 · 이름 / 전공 · 전화번호
         self.add_entries = {}
         for i, (key, title) in enumerate(self.ADD_FIELDS):
-            row, col = 4 + (i // 2) * 2, i % 2
+            row, col = 5 + (i // 2) * 2, i % 2
             padx = (0, px(6)) if col == 0 else (px(6), 0)
             admin_field_label(form, title).grid(row=row, column=col, sticky=tk.W, padx=padx, pady=(px(6), px(4)))
             field = AdminField(form, font_size=13)
@@ -3645,10 +3736,15 @@ class AdminDashboardFrame(tk.Frame):
             if self._fill_blanks_from_roster():
                 self.load_students()
             live = f" · {ROSTER_REFRESH_SECONDS}초마다 자동 갱신" if result["source"] == "구글 시트" else ""
+            # 창공시스템이 기준 명단일 때만 — 거기서 삭제됐는데 얼굴인식에는 남아 있는 학생
+            removed = find_removed_students(self._roster) if result["source"] == "창공시스템" else []
+            gone = f" · 창공시스템에서 삭제됨 {len(removed)}명" if removed else ""
             self.lbl_roster_status.config(
-                text=f"● {result['source']} 명단 {len(self._roster)}명 · 미등록 {len(self._roster_map)}명 "
-                     f"· {now} 업데이트{live}", fg=OK)
-            if show_message:
+                text=f"● {result['source']} 명단 {len(self._roster)}명 · 미등록 {len(self._roster_map)}명{gone} "
+                     f"· {now} 업데이트{live}", fg=WARN if removed else OK)
+            if show_message and removed:
+                messagebox.showwarning("창공시스템에서 삭제된 학생", removed_students_message(removed))
+            elif show_message:
                 messagebox.showinfo(
                     "새로고침 완료",
                     f"{result['source']} 명단 {len(self._roster)}건을 다시 불러왔습니다.\n"
@@ -3675,8 +3771,9 @@ class AdminDashboardFrame(tk.Frame):
             return ("서비스 계정 키 파일이 없습니다.\n"
                     "[설정] 탭의 '서비스 계정 키'에서 Google Cloud에서 받은 JSON 키 파일을 골라주세요.")
         if isinstance(error, FileNotFoundError):
-            return ("roster.json 파일을 찾을 수 없습니다.\n"
-                    "[설정] 탭에 구글폼 응답 주소를 넣거나, 창공시스템을 먼저 실행해서 학생을 등록해주세요.\n\n"
+            return ("창공시스템 명단(roster.json) 파일을 찾을 수 없습니다.\n"
+                    "같은 윈도우 계정에서 창공시스템을 한 번 실행하면 만들어집니다.\n"
+                    "또는 [설정] 탭의 '학생 명단 출처'를 구글폼으로 바꿔주세요.\n\n"
                     f"찾아본 위치:\n{ROSTER_PATH}")
         if isinstance(error, json.JSONDecodeError):
             return (f"roster.json 파일의 형식이 올바르지 않습니다 (JSON 오류: {error}).\n"
@@ -3732,11 +3829,20 @@ class AdminDashboardFrame(tk.Frame):
         current = self.roster_combo.get()
         self.roster_combo["values"] = values
         self.roster_combo.set(current if current in self._roster_map else "")
+        if current not in self._roster_map:
+            self.lbl_roster_extra.config(text="")
+
+    # 명단에는 있지만 등록 입력칸은 없는 항목 — 고른 학생 아래에 글로만 보여준다
+    ROSTER_EXTRA_FIELDS = (("Advisor", "지도교수"), ("Email", "이메일"))
 
     def on_roster_selected(self, event):
         student = self._roster_map.get(self.roster_combo.get())
         if not student:
+            self.lbl_roster_extra.config(text="")
             return
+        extra = [f"{title} {str(student.get(field)).strip()}" for field, title in self.ROSTER_EXTRA_FIELDS
+                 if str(student.get(field) or "").strip()]
+        self.lbl_roster_extra.config(text=" · ".join(extra))
         self.clear_add_form()
         for key, field in (("id", "StudentId"), ("name", "Name"), ("major", "Department"), ("phone", "Phone"),
                            ("grade", "Grade")):
@@ -4319,7 +4425,14 @@ class AttendanceApp:
 
         # 창공시스템 명단(roster.json) — 얼굴 인식 결과에 표시할 이름을 여기서 우선 찾는다
         self.roster_lookup = {}
-        self.apply_roster(load_roster())
+        roster = load_roster()
+        self.apply_roster(roster)
+        # 창공시스템에서 삭제됐는데 얼굴인식에는 남아 있는 학생이 있으면 켤 때 한 번 알려준다 (화면이 뜬 뒤에)
+        if roster_source() == "seat":
+            removed = find_removed_students(roster)
+            if removed:
+                self.after(1500, lambda: messagebox.showwarning(
+                    "창공시스템에서 삭제된 학생", removed_students_message(removed), parent=self))
 
         # 화면 상태
         #   idle       : 메인 화면. 카메라/얼굴 인식 꺼짐, 출근·퇴근 버튼만 보인다

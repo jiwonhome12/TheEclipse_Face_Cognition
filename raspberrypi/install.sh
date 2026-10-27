@@ -145,6 +145,8 @@ step "파이썬 패키지 설치 — insightface는 라즈베리파이에서 직
 # 화면은 Tk가 그리므로 OpenCV는 GUI 없는(headless) 버전으로 충분하고 더 가볍다
 "$PY" -m pip install numpy Cython
 "$PY" -m pip install opencv-python-headless pillow openpyxl onnxruntime
+# 관리자 [학생 등록]의 구글폼 학생 명단(Sheets API, 서비스 계정) 연동
+"$PY" -m pip install google-auth requests
 "$PY" -m pip install insightface
 ok "얼굴 인식 패키지 설치 완료"
 
@@ -183,6 +185,7 @@ step "설치 확인"
 check_packages() {
     "$PY" - <<'EOF'
 import cv2, numpy, onnxruntime, insightface, PIL, tkinter, openpyxl  # noqa: F401
+import google.auth, requests  # noqa: F401  (구글폼 명단 연동)
 from insightface.app import FaceAnalysis  # noqa: F401  (의존 패키지까지 다 들어왔는지)
 print(f"  OpenCV {cv2.__version__} · onnxruntime {onnxruntime.__version__} · insightface {insightface.__version__}")
 EOF
@@ -197,7 +200,8 @@ else
     else
         # 설치 도중 끊기면 pip는 '설치됨'으로 기록했는데 파일이 덜 풀린 패키지가 남을 수 있다 — 강제로 다시 설치한다
         warn "덜 설치된 패키지가 있습니다 (이전 설치가 중간에 끊긴 경우). 다시 설치합니다 — 시간이 더 걸릴 수 있습니다."
-        "$PY" -m pip install --force-reinstall numpy opencv-python-headless pillow openpyxl onnxruntime insightface
+        "$PY" -m pip install --force-reinstall numpy opencv-python-headless pillow openpyxl onnxruntime insightface \
+            google-auth requests
     fi
 fi
 

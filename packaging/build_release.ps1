@@ -2,7 +2,7 @@
 #   powershell -ExecutionPolicy Bypass -File packaging\build_release.ps1
 # 결과: dist\TheEclipseAttendance-windows.zip
 # (GitHub에 v* 태그를 올리면 .github/workflows/release-windows.yml 이 이 스크립트로 자동 빌드한다)
-param([string]$OutDir = "")
+param([string]$OutDir = "", [string]$Version = (Get-Date -Format "yyyy.MM.dd"))
 $ErrorActionPreference = "Stop"
 $Root = Split-Path -Parent $PSScriptRoot
 # 경로가 길면(260자 제한) 빌드가 실패해서 작업 폴더는 짧은 임시 경로를 쓴다
@@ -25,3 +25,19 @@ if (Test-Path $Zip) { Remove-Item $Zip }
 # 압축 풀면 TheEclipseAttendance 폴더 하나가 나오도록
 Compress-Archive -Path $AppOut -DestinationPath $Zip -CompressionLevel Optimal
 Write-Host ("완료: {0} ({1:N0} MB)" -f $Zip, ((Get-Item $Zip).Length / 1MB))
+
+# 설치 프로그램(Setup.exe) 만들기 — Inno Setup 6이 있을 때만 (없으면 건너뛴다)
+$Iscc = @(
+    (Get-Command ISCC.exe -ErrorAction SilentlyContinue).Source,
+    "$env:LOCALAPPDATA\Programs\Inno Setup 6\ISCC.exe",
+    "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe",
+    "$env:ProgramFiles\Inno Setup 6\ISCC.exe"
+) | Where-Object { $_ -and (Test-Path $_) } | Select-Object -First 1
+if ($Iscc) {
+    $Setup = Join-Path $Dist "TheEclipseAttendance-Setup.exe"
+    & $Iscc "/DMyAppVersion=$Version" "/DSourceDir=$AppOut" "/O$Dist" (Join-Path $PSScriptRoot "installer\TheEclipseAttendance.iss")
+    if ($LASTEXITCODE -ne 0) { throw "설치 프로그램 만들기 실패" }
+    Write-Host ("완료: {0} ({1:N0} MB)" -f $Setup, ((Get-Item $Setup).Length / 1MB))
+} else {
+    Write-Host "Inno Setup 6이 없어 설치 프로그램(Setup.exe)은 만들지 않았습니다. (winget install JRSoftware.InnoSetup)"
+}

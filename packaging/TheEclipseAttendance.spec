@@ -10,7 +10,10 @@ from PyInstaller.utils.hooks import collect_all
 
 ROOT = os.path.abspath(os.path.join(SPECPATH, ".."))
 
-datas = [(os.path.join(ROOT, "face_landmarker.task"), ".")]  # 눈 깜빡임 검사 모델 (Apache 2.0)
+datas = [
+    (os.path.join(ROOT, "face_landmarker.task"), "."),   # 눈 깜빡임 검사 모델 (Apache 2.0)
+    (os.path.join(ROOT, "assets"), "assets"),            # "눈을 깜빡여 주세요" 안내 GIF 등
+]
 binaries = []
 # 구글 Sheets API는 함수 안에서 불러와서 PyInstaller가 못 찾으므로 직접 넣는다
 hiddenimports = ["google.oauth2.service_account", "google.auth.transport.requests"]

@@ -12,7 +12,8 @@ ROOT = os.path.abspath(os.path.join(SPECPATH, ".."))
 
 datas = [(os.path.join(ROOT, "face_landmarker.task"), ".")]  # 눈 깜빡임 검사 모델 (Apache 2.0)
 binaries = []
-hiddenimports = []
+# 구글 Sheets API는 함수 안에서 불러와서 PyInstaller가 못 찾으므로 직접 넣는다
+hiddenimports = ["google.oauth2.service_account", "google.auth.transport.requests"]
 for package in ("mediapipe", "insightface"):
     pkg_datas, pkg_binaries, pkg_hidden = collect_all(package)
     datas += pkg_datas

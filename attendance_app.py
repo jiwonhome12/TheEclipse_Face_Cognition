@@ -860,21 +860,14 @@ GOOGLE_FORM_COLUMNS = {
 }
 
 
-def load_google_form_roster(url, timeout=10):
+def roster_from_rows(rows):
     """
-    구글폼 응답 시트를 [파일 → 공유 → 웹에 게시 → CSV]로 게시한 주소에서 학생 명단을 읽는다.
-    roster.json과 같은 모양({StudentId, Name, Department, Phone})의 목록으로 돌려준다.
+    응답 시트의 행 목록(첫 행은 열 제목)을 roster.json과 같은 모양({StudentId, Name, Department, Phone})으로 바꾼다.
     같은 학번이 여러 번 응답했으면 마지막 응답을 쓴다.
     """
-    import csv
-    import io
-    import urllib.request
-    with urllib.request.urlopen(url, timeout=timeout) as resp:
-        text = resp.read().decode("utf-8-sig")
-    rows = list(csv.reader(io.StringIO(text)))
     if not rows:
         return []
-    header = rows[0]
+    header = [str(title) for title in rows[0]]
 
     def find(keys):
         return next((i for i, title in enumerate(header) if any(k in title for k in keys)), None)
@@ -885,20 +878,99 @@ def load_google_form_roster(url, timeout=10):
                          f"찾은 열: {', '.join(header)}")
     students = {}
     for row in rows[1:]:
-        entry = {field: (row[i].strip() if i is not None and i < len(row) else "")
+        entry = {field: (str(row[i]).strip() if i is not None and i < len(row) else "")
                  for field, i in index.items()}
         if entry["StudentId"]:
             students[entry["StudentId"]] = entry
     return list(students.values())
 
 
+def load_google_form_roster(url, timeout=10):
+    """구글폼 응답 시트를 [파일 → 공유 → 웹에 게시 → CSV]로 게시한 주소에서 학생 명단을 읽는다."""
+    import csv
+    import urllib.request
+    with urllib.request.urlopen(url, timeout=timeout) as resp:
+        text = resp.read().decode("utf-8-sig")
+    return roster_from_rows(list(csv.reader(io.StringIO(text))))
+
+
+# 구글 Sheets API — 응답 시트를 웹에 게시하지 않고, 서비스 계정에 '보기' 권한으로 공유해서 읽는다.
+# 키 파일은 관리자 [설정]에서 고르면 프로그램 폴더로 복사된다 (비밀 키라서 git에는 올리지 않는다).
+GOOGLE_KEY_PATH = os.path.join(APP_DIR, "google_service_account.json")
+SHEETS_API_URL = "https://sheets.googleapis.com/v4/spreadsheets"
+ROSTER_REFRESH_SECONDS = 15  # [학생 등록] 탭이 열려 있는 동안 이 간격으로 명단을 다시 읽는다
+
+
+class SheetsApiError(Exception):
+    """Sheets API가 오류로 답했을 때 — status(HTTP 코드)와 구글이 준 설명을 담는다."""
+
+    def __init__(self, status, detail):
+        super().__init__(f"{status}: {detail}")
+        self.status = status
+        self.detail = detail
+
+
+def google_sheet_id(url):
+    """구글 시트 편집 주소(…/spreadsheets/d/<ID>/edit…)에서 시트 ID를 꺼낸다. 웹에 게시한 주소(/d/e/…)는 None."""
+    import re
+    match = re.search(r"/spreadsheets/d/([A-Za-z0-9_-]{20,})", url)
+    return match.group(1) if match else None
+
+
+def google_service_account_email(path=GOOGLE_KEY_PATH):
+    """키 파일의 서비스 계정 이메일 (응답 시트를 이 주소에 공유해야 한다). 키가 없거나 이상하면 None."""
+    try:
+        with open(path, encoding="utf-8") as f:
+            info = json.load(f)
+    except (OSError, ValueError):
+        return None
+    if info.get("type") != "service_account" or not info.get("private_key"):
+        return None
+    return info.get("client_email")
+
+
+_sheets_session = {}
+
+
+def _sheets_api_session():
+    """서비스 계정으로 인증된 세션. 키 파일이 바뀌지 않았으면 다시 만들지 않는다 (토큰도 재사용)."""
+    from google.auth.transport.requests import AuthorizedSession
+    from google.oauth2 import service_account
+    if not os.path.exists(GOOGLE_KEY_PATH):
+        raise FileNotFoundError(2, "서비스 계정 키 파일이 없습니다", GOOGLE_KEY_PATH)
+    mtime = os.path.getmtime(GOOGLE_KEY_PATH)
+    if _sheets_session.get("mtime") != mtime:
+        creds = service_account.Credentials.from_service_account_file(
+            GOOGLE_KEY_PATH, scopes=["https://www.googleapis.com/auth/spreadsheets.readonly"])
+        _sheets_session.update(mtime=mtime, session=AuthorizedSession(creds))
+    return _sheets_session["session"]
+
+
+def load_sheets_api_roster(sheet_id, timeout=10):
+    """Sheets API로 응답 시트(첫 번째 시트)의 A~Z열을 읽어 학생 명단으로 바꾼다."""
+    resp = _sheets_api_session().get(f"{SHEETS_API_URL}/{sheet_id}/values/A:Z", timeout=timeout)
+    if resp.status_code != 200:
+        try:
+            detail = resp.json()["error"]["message"]
+        except (ValueError, KeyError, TypeError):
+            detail = resp.text[:200]
+        raise SheetsApiError(resp.status_code, detail)
+    return roster_from_rows(resp.json().get("values", []))
+
+
 def load_student_roster():
     """
-    학생 등록에 쓰는 명단과 그 출처 이름. 설정에 구글폼 응답 주소가 있으면 구글폼에서,
-    없으면 창공시스템 roster.json에서 읽는다. 읽지 못하면 예외를 그대로 올린다.
+    학생 등록에 쓰는 명단과 그 출처 이름. 설정의 주소가
+      - 구글 시트 주소(…/spreadsheets/d/<ID>/…)면 Sheets API로 (서비스 계정 키 필요, 시트 공개 안 해도 됨)
+      - 웹에 게시한 CSV 주소면 그 CSV로
+      - 비어 있으면 창공시스템 roster.json에서 읽는다.
+    읽지 못하면 예외를 그대로 올린다.
     """
     url = str(load_settings().get("google_form_csv_url", "")).strip()
     if url:
+        sheet_id = google_sheet_id(url)
+        if sheet_id:
+            return load_sheets_api_roster(sheet_id), "구글 시트"
         return load_google_form_roster(url), "구글폼"
     return load_roster_strict(), "창공시스템"
 
@@ -3020,6 +3092,22 @@ class AdminDashboardFrame(tk.Frame):
         registering = self.notebook.select() == str(self.tab_add_student)
         self.parent.show_admin_camera(self.register_camera if registering else None)
         self.after(1500, self.show_camera_info)
+        self._schedule_roster_refresh(now=registering)
+
+    def _schedule_roster_refresh(self, now=False):
+        """[학생 등록] 탭이 열려 있는 동안만 명단을 주기적으로 다시 읽는다 (구글폼에 새 응답이 들어오면 바로 보이게)."""
+        if self._roster_job is not None:
+            self.after_cancel(self._roster_job)
+            self._roster_job = None
+        if not self.winfo_exists() or self.notebook.select() != str(self.tab_add_student):
+            return
+        if now:
+            self._fetch_roster()
+        self._roster_job = self.after(ROSTER_REFRESH_SECONDS * 1000, self._auto_refresh_roster)
+
+    def _auto_refresh_roster(self):
+        self._roster_job = None
+        self._schedule_roster_refresh(now=True)
 
     def choose_osk(self, enabled):
         self.parent.set_osk_enabled(enabled)
@@ -3361,8 +3449,14 @@ class AdminDashboardFrame(tk.Frame):
         self.lbl_camera_info.pack(anchor=tk.E, pady=(0, px(6)))
 
         # 학생 명단 — 구글폼 응답 시트를 CSV로 웹에 게시한 주소 ([학생 등록]의 구글폼 학생 명단)
+        # 서비스 계정 키 — 이 계정에 응답 시트를 '뷰어'로 공유하면 시트를 공개하지 않고 읽는다
+        r = setting_row(right, "서비스 계정 키", "")
+        self.lbl_key_email = r.winfo_children()[0].winfo_children()[1]
+        RoundButton(r, text="키 파일 선택", command=self.choose_google_key, **choice).pack(side=tk.RIGHT)
+        self._show_key_email()
+
         r = setting_row(right, "구글폼 학생 명단 주소",
-                        "응답 시트 → 파일 → 공유 → 웹에 게시 → CSV 주소")
+                        "응답 시트 주소(실시간) 또는 CSV로 게시한 주소")
         RoundButton(r, text="저장", command=self.save_google_form_url, **choice).pack(side=tk.RIGHT)
         url_box = RoundedBox(right, fill="#FFFFFF", bg=ADMIN_CARD, radius=px(10), pad=px(8), outline=ADMIN_BORDER)
         url_box.pack(fill=tk.X)
@@ -3370,13 +3464,36 @@ class AdminDashboardFrame(tk.Frame):
                                      fg=TEXT, highlightthickness=0, width=10)
         self.ent_form_url.pack(fill=tk.X)
         self.ent_form_url.insert(0, str(load_settings().get("google_form_csv_url", "")))
-        tk.Label(right, text="비워 두면 창공시스템 명단(roster.json)을 씁니다.", font=(UI_FONT, 10),
+        tk.Label(right, text="시트 주소를 넣으면 Sheets API로 실시간으로 읽고, 비워 두면 창공시스템 명단(roster.json)을 씁니다.",
+                 wraplength=px(620), justify=tk.LEFT, font=(UI_FONT, 10),
                  bg=ADMIN_CARD, fg=MUTED).pack(anchor=tk.W, pady=(px(6), 0))
+
+    def _show_key_email(self):
+        email = google_service_account_email()
+        self.lbl_key_email.config(text=email or "Google Cloud에서 받은 JSON 키 파일을 고르세요",
+                                  fg=TEXT_SUB if email else ERR)
+
+    def choose_google_key(self):
+        """서비스 계정 JSON 키를 골라 프로그램 폴더에 복사하고, 시트를 공유할 이메일을 알려준다."""
+        path = filedialog.askopenfilename(title="서비스 계정 키(JSON) 선택", filetypes=[("JSON 키", "*.json")])
+        if not path:
+            return
+        email = google_service_account_email(path)
+        if not email:
+            messagebox.showerror("키 파일 오류", "서비스 계정 JSON 키가 아닙니다.\n"
+                                 "Google Cloud → IAM 및 관리자 → 서비스 계정 → 키 → [JSON]으로 받은 파일을 골라주세요.")
+            return
+        shutil.copyfile(path, GOOGLE_KEY_PATH)
+        self._show_key_email()
+        messagebox.showinfo("키 등록 완료", "서비스 계정 키를 등록했습니다.\n\n"
+                            "응답 시트의 [공유]에서 아래 이메일을 '뷰어'로 추가해야 명단을 읽을 수 있습니다.\n\n"
+                            f"{email}")
 
     def save_google_form_url(self):
         url = self.ent_form_url.get().strip()
         if url and not url.startswith(("http://", "https://")):
-            messagebox.showerror("주소 오류", "구글폼 응답 시트를 CSV로 게시한 https:// 주소를 넣어주세요.")
+            messagebox.showerror("주소 오류", "구글 응답 시트 주소(https://docs.google.com/spreadsheets/d/...) 또는 "
+                                 "CSV로 게시한 https:// 주소를 넣어주세요.")
             return
         save_setting("google_form_csv_url", url)
         self._fetch_roster(show_message=True)  # 바로 읽어 봐서 주소가 맞는지 알려준다
@@ -3445,13 +3562,17 @@ class AdminDashboardFrame(tk.Frame):
                                          style="Admin.TCombobox")
         self.roster_combo.pack(side=tk.LEFT, fill=tk.X, expand=True)
         self.roster_combo.bind("<<ComboboxSelected>>", self.on_roster_selected)
+        # 명단을 언제 읽었는지 — 이 탭이 열려 있으면 ROSTER_REFRESH_SECONDS마다 저절로 다시 읽는다
+        self.lbl_roster_status = tk.Label(form, text="명단을 불러오는 중...", font=(UI_FONT, 10), bg=ADMIN_CARD,
+                                          fg=MUTED, anchor=tk.W)
+        self.lbl_roster_status.grid(row=2, column=0, columnspan=2, sticky=tk.W, pady=(px(6), 0))
 
-        tk.Frame(form, bg=LINE, height=1).grid(row=2, column=0, columnspan=2, sticky=tk.EW, pady=px(20))
+        tk.Frame(form, bg=LINE, height=1).grid(row=3, column=0, columnspan=2, sticky=tk.EW, pady=px(18))
 
         # 학번 · 이름 / 전공 · 전화번호
         self.add_entries = {}
         for i, (key, title) in enumerate(self.ADD_FIELDS):
-            row, col = 3 + (i // 2) * 2, i % 2
+            row, col = 4 + (i // 2) * 2, i % 2
             padx = (0, px(6)) if col == 0 else (px(6), 0)
             admin_field_label(form, title).grid(row=row, column=col, sticky=tk.W, padx=padx, pady=(px(6), px(4)))
             field = AdminField(form, font_size=13)
@@ -3465,6 +3586,8 @@ class AdminDashboardFrame(tk.Frame):
 
         self._roster = []
         self._roster_map = {}
+        self._roster_job = None     # 다음 자동 새로고침 예약
+        self._roster_fetching = False
         self._fetch_roster()
 
     def clear_add_form(self):
@@ -3481,6 +3604,9 @@ class AdminDashboardFrame(tk.Frame):
         명단(구글폼 또는 창공시스템)을 다시 읽어 [학생 등록] 목록과 얼굴 인식 이름 표시에 반영한다.
         구글폼은 인터넷에서 받아 오므로 뒤에서 읽고, 다 읽으면 화면에 반영한다 (그동안 화면이 멈추지 않게).
         """
+        if self._roster_fetching:  # 이미 읽는 중이면 겹쳐서 부르지 않는다
+            return
+        self._roster_fetching = True
         result = {}
 
         def work():
@@ -3498,13 +3624,21 @@ class AdminDashboardFrame(tk.Frame):
             if worker.is_alive():
                 self.after(100, finish)
                 return
+            self._roster_fetching = False
+            now = datetime.now().strftime("%H:%M:%S")
             if "error" in result:
+                self.lbl_roster_status.config(text=f"● 명단을 불러오지 못했습니다 ({now}) — 새로고침을 눌러 원인 확인",
+                                              fg=ERR)
                 if show_message:
                     messagebox.showerror("새로고침 실패", self._roster_error_message(result["error"]))
                 return
             self._roster = result["roster"]
             self.parent.apply_roster(self._roster)
             self.reload_roster_combo()
+            live = f" · {ROSTER_REFRESH_SECONDS}초마다 자동 갱신" if result["source"] == "구글 시트" else ""
+            self.lbl_roster_status.config(
+                text=f"● {result['source']} 명단 {len(self._roster)}명 · 미등록 {len(self._roster_map)}명 "
+                     f"· {now} 업데이트{live}", fg=OK)
             if show_message:
                 messagebox.showinfo(
                     "새로고침 완료",
@@ -3517,6 +3651,20 @@ class AdminDashboardFrame(tk.Frame):
     @staticmethod
     def _roster_error_message(error):
         import urllib.error
+        if isinstance(error, SheetsApiError):
+            if error.status == 403 and "has not been used" in error.detail:
+                return ("Google Cloud 프로젝트에서 Google Sheets API가 꺼져 있습니다.\n"
+                        "Cloud 콘솔 → API 및 서비스 → 라이브러리에서 'Google Sheets API'를 사용 설정해주세요.\n\n"
+                        f"{error.detail}")
+            if error.status in (403, 404):
+                email = google_service_account_email() or "(키 파일의 서비스 계정 이메일)"
+                return ("응답 시트를 읽을 권한이 없거나 시트를 찾지 못했습니다.\n"
+                        f"응답 시트의 [공유]에서 아래 이메일을 '뷰어'로 추가해주세요.\n\n{email}\n\n"
+                        f"({error.status}: {error.detail})")
+            return f"구글 시트를 읽지 못했습니다.\n\n{error.status}: {error.detail}"
+        if isinstance(error, FileNotFoundError) and error.filename == GOOGLE_KEY_PATH:
+            return ("서비스 계정 키 파일이 없습니다.\n"
+                    "[설정] 탭의 '서비스 계정 키'에서 Google Cloud에서 받은 JSON 키 파일을 골라주세요.")
         if isinstance(error, FileNotFoundError):
             return ("roster.json 파일을 찾을 수 없습니다.\n"
                     "[설정] 탭에 구글폼 응답 주소를 넣거나, 창공시스템을 먼저 실행해서 학생을 등록해주세요.\n\n"
@@ -3524,7 +3672,8 @@ class AdminDashboardFrame(tk.Frame):
         if isinstance(error, json.JSONDecodeError):
             return (f"roster.json 파일의 형식이 올바르지 않습니다 (JSON 오류: {error}).\n"
                     "창공시스템 쪽에서 파일이 다 써지는 중에 읽었을 수도 있으니 잠시 후 다시 시도해주세요.")
-        if isinstance(error, (urllib.error.URLError, OSError)):
+        if isinstance(error, (urllib.error.URLError, OSError)) or type(error).__module__.startswith(
+                ("requests", "google.auth")):
             return ("구글폼 응답을 불러오지 못했습니다.\n"
                     f"인터넷 연결과 [설정] 탭의 구글폼 응답 주소를 확인해주세요.\n\n{error}")
         return f"명단을 불러오는 중 오류가 발생했습니다.\n\n{error}"
@@ -3547,8 +3696,10 @@ class AdminDashboardFrame(tk.Frame):
             self._roster_map[label] = student
             values.append(label)
 
+        # 자동 새로고침 중에도 고르던 학생은 그대로 둔다 (방금 등록해서 목록에서 빠졌으면 비운다)
+        current = self.roster_combo.get()
         self.roster_combo["values"] = values
-        self.roster_combo.set("")
+        self.roster_combo.set(current if current in self._roster_map else "")
 
     def on_roster_selected(self, event):
         student = self._roster_map.get(self.roster_combo.get())
